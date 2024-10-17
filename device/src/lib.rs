@@ -14,13 +14,14 @@
 //! # Traits to implement by the VMM
 //!
 //! * Descriptor chains must implement `Read` and `Write` on their device-readable and
-//! device-writable parts, respectively. This allows devices to read commands and writes responses.
+//!   device-writable parts, respectively. This allows devices to read commands and writes
+//!   responses.
 //! * The event queue must implement the `VirtioMediaEventQueue` trait to allow devices to send
-//! events to the guest.
+//!   events to the guest.
 //! * The guest memory must be made accessible through an implementation of
-//! `VirtioMediaGuestMemoryMapper`.
+//!   `VirtioMediaGuestMemoryMapper`.
 //! * Optionally, .... can be implemented if the host supports mapping MMAP buffers into the guest
-//! address space.
+//!   address space.
 //!
 //! These traits allow any device that implements `VirtioMediaDevice` to run on any VMM that
 //! implements them.
@@ -42,16 +43,21 @@
 //! The devices currently in this crate are:
 //!
 //! * A device that proxies any host V4L2 device into the guest, in the `crate::v4l2_device_proxy`
-//! module.
+//!   module.
 
 pub mod devices;
 pub mod ioctl;
+pub mod memfd;
 pub mod mmap;
+pub mod poll;
 pub mod protocol;
 
+use poll::SessionPoller;
+pub use v4l2r;
+
 use std::collections::HashMap;
-use std::fs::File;
 use std::io::Result as IoResult;
+use std::os::fd::BorrowedFd;
 
 use anyhow::Context;
 use log::error;
@@ -59,56 +65,6 @@ use zerocopy::AsBytes;
 use zerocopy::FromBytes;
 
 use protocol::*;
-
-/// Local trait for reading data from the device-readable section of a descriptor chain.
-trait ReadDescriptorChain {
-    fn read_obj<T: FromBytes>(&mut self) -> std::io::Result<T>;
-}
-
-/// Any implementor of `Read` can be used to read virtio-media commands.
-impl<R> ReadDescriptorChain for R
-where
-    R: std::io::Read,
-{
-    fn read_obj<T: FromBytes>(&mut self) -> std::io::Result<T> {
-        let mut obj = std::mem::MaybeUninit::uninit();
-        // Safe because the slice boundaries cover `obj`, and the slice doesn't outlive it.
-        let slice = unsafe {
-            std::slice::from_raw_parts_mut(obj.as_mut_ptr() as *mut u8, std::mem::size_of::<T>())
-        };
-
-        self.read_exact(slice)?;
-
-        // Safe because obj can be initialized from an array of bytes.
-        Ok(unsafe { obj.assume_init() })
-    }
-}
-
-/// Trait for writing data into the device-writable section of a descriptor chain.
-trait WriteDescriptorChain {
-    /// Write an arbitrary object to the guest.
-    fn write_obj<T: AsBytes>(&mut self, obj: &T) -> IoResult<()>;
-
-    /// Write a command response to the guest.
-    fn write_response<T: AsBytes>(&mut self, response: T) -> IoResult<()> {
-        self.write_obj(&response)
-    }
-
-    /// Send `code` as the error code of an error response.
-    fn write_err_response(&mut self, code: libc::c_int) -> IoResult<()> {
-        self.write_response(RespHeader::err(code))
-    }
-}
-
-/// Any implementor of `Write` can be used to write virtio-media responses.
-impl<W> WriteDescriptorChain for W
-where
-    W: std::io::Write,
-{
-    fn write_obj<T: AsBytes>(&mut self, obj: &T) -> IoResult<()> {
-        self.write_all(obj.as_bytes())
-    }
-}
 
 /// Trait for reading objects from a reader, e.g. the device-readable section of a descriptor
 /// chain.
@@ -135,6 +91,13 @@ pub trait VirtioMediaEventQueue {
     }
 }
 
+/// Trait for representing a range of guest memory that has been mapped linearly into the host's
+/// address space.
+pub trait GuestMemoryRange {
+    fn as_ptr(&self) -> *const u8;
+    fn as_mut_ptr(&mut self) -> *mut u8;
+}
+
 /// Trait enabling guest memory linear access for the device.
 ///
 /// Although the host can access the guest memory, it sometimes need to have a linear view of
@@ -145,7 +108,7 @@ pub trait VirtioMediaEventQueue {
 /// implementations might e.g. write back into the guest memory at destruction time.
 pub trait VirtioMediaGuestMemoryMapper {
     /// Host-side linear mapping of sparse guest memory.
-    type GuestMemoryMapping: AsRef<[u8]> + AsMut<[u8]>;
+    type GuestMemoryMapping: GuestMemoryRange;
 
     /// Maps `sgs`, which contains a list of guest-physical SG entries into a linear mapping on the
     /// host.
@@ -162,27 +125,42 @@ pub trait VirtioMediaGuestMemoryMapper {
 /// map `MMAP` buffers into the guest.
 pub trait VirtioMediaHostMemoryMapper {
     /// Maps `length` bytes of host memory starting at `offset` and backed by `buffer` into the
-    /// guest address space.
+    /// guest's shared memory region.
     ///
-    /// Returns the guest physical address of the start of the mapped memory on success, or a
-    /// `libc` error code in case of failure.
-    fn add_mapping(&mut self, buffer: File, length: u64, offset: u64, rw: bool)
-        -> Result<u64, i32>;
+    /// Returns the offset in the guest shared memory region of the start of the mapped memory on
+    /// success, or a `libc` error code in case of failure.
+    fn add_mapping(
+        &mut self,
+        buffer: BorrowedFd,
+        length: u64,
+        offset: u64,
+        rw: bool,
+    ) -> Result<u64, i32>;
 
-    /// Removes a guest mapping previously created at guest physical memory address `guest_addr`.
-    fn remove_mapping(&mut self, guest_addr: u64) -> Result<(), i32>;
+    /// Removes a guest mapping previously created at shared memory region offset `shm_offset`.
+    fn remove_mapping(&mut self, shm_offset: u64) -> Result<(), i32>;
 }
 
 /// No-op implementation of `VirtioMediaHostMemoryMapper`. Can be used for testing purposes or when
 /// it is not needed to map `MMAP` buffers into the guest.
 impl VirtioMediaHostMemoryMapper for () {
-    fn add_mapping(&mut self, _: File, _: u64, _: u64, _: bool) -> Result<u64, i32> {
+    fn add_mapping(&mut self, _: BorrowedFd, _: u64, _: u64, _: bool) -> Result<u64, i32> {
         Err(libc::ENOTTY)
     }
 
     fn remove_mapping(&mut self, _: u64) -> Result<(), i32> {
         Err(libc::ENOTTY)
     }
+}
+
+pub trait VirtioMediaDeviceSession {
+    /// Returns the file descriptor that the client can listen to in order to know when a session
+    /// event has occurred. The FD signals that it is readable when the device's `process_events`
+    /// should be called.
+    ///
+    /// If this method returns `None`, then the session does not need to be polled by the client,
+    /// and `process_events` does not need to be called either.
+    fn poll_fd(&self) -> Option<BorrowedFd>;
 }
 
 /// Trait for implementing virtio-media devices.
@@ -192,7 +170,7 @@ impl VirtioMediaHostMemoryMapper for () {
 /// [`ioctl::VirtioMediaIoctlHandler`] should also be used to automatically parse and dispatch
 /// ioctls.
 pub trait VirtioMediaDevice<Reader: std::io::Read, Writer: std::io::Write> {
-    type Session;
+    type Session: VirtioMediaDeviceSession;
 
     /// Create a new session which ID is `session_id`.
     ///
@@ -221,7 +199,7 @@ pub trait VirtioMediaDevice<Reader: std::io::Read, Writer: std::io::Write> {
         writer: &mut Writer,
     ) -> IoResult<()>;
 
-    /// Performs the MMAP command and write the response into `writer`.
+    /// Performs the MMAP command.
     ///
     /// Only returns an error if the response could not be properly written ; all other errors are
     /// propagated to the guest.
@@ -232,48 +210,112 @@ pub trait VirtioMediaDevice<Reader: std::io::Read, Writer: std::io::Write> {
         session: &mut Self::Session,
         flags: u32,
         offset: u64,
-        writer: &mut Writer,
-    ) -> IoResult<()>;
-    /// Performs the MUNMAP command and write the response into `writer`.
+    ) -> Result<(u64, u64), i32>;
+    /// Performs the MUNMAP command.
     ///
     /// Only returns an error if the response could not be properly written ; all other errors are
     /// propagated to the guest.
-    fn do_munmap(&mut self, guest_addr: u64, writer: &mut Writer) -> IoResult<()>;
+    fn do_munmap(&mut self, guest_addr: u64) -> Result<(), i32>;
+
+    fn process_events(&mut self, _session: &mut Self::Session) -> Result<(), i32> {
+        panic!("process_events needs to be implemented")
+    }
 }
 
 /// Wrapping structure for a `VirtioMediaDevice` managing its sessions and providing methods for
 /// processing its commands.
-pub struct VirtioMediaDeviceRunner<Reader, Writer, Device>
+pub struct VirtioMediaDeviceRunner<Reader, Writer, Device, Poller>
 where
     Reader: std::io::Read,
     Writer: std::io::Write,
     Device: VirtioMediaDevice<Reader, Writer>,
+    Poller: SessionPoller,
 {
     pub device: Device,
+    poller: Poller,
     pub sessions: HashMap<u32, Device::Session>,
+    // TODO: recycle session ids...
     session_id_counter: u32,
 }
 
-impl<Reader, Writer, Device> From<Device> for VirtioMediaDeviceRunner<Reader, Writer, Device>
+impl<Reader, Writer, Device, Poller> VirtioMediaDeviceRunner<Reader, Writer, Device, Poller>
 where
     Reader: std::io::Read,
     Writer: std::io::Write,
     Device: VirtioMediaDevice<Reader, Writer>,
+    Poller: SessionPoller,
 {
-    fn from(device: Device) -> Self {
+    pub fn new(device: Device, poller: Poller) -> Self {
         Self {
             device,
+            poller,
             sessions: Default::default(),
             session_id_counter: 0,
         }
     }
 }
 
-impl<Reader, Writer, Device> VirtioMediaDeviceRunner<Reader, Writer, Device>
+/// Crate-local extension trait for reading objects from the device-readable section of a
+/// descriptor chain.
+trait ReadFromDescriptorChain {
+    fn read_obj<T: FromBytes>(&mut self) -> std::io::Result<T>;
+}
+
+/// Any implementor of `Read` can be used to read virtio-media commands.
+impl<R> ReadFromDescriptorChain for R
+where
+    R: std::io::Read,
+{
+    fn read_obj<T: FromBytes>(&mut self) -> std::io::Result<T> {
+        // We use `zeroed` instead of `uninit` because `read_exact` cannot be called with
+        // uninitialized memory. Since `T` implements `FromBytes`, its zeroed form is valid and
+        // initialized.
+        let mut obj = std::mem::MaybeUninit::zeroed();
+        // Safe because the slice boundaries cover `obj`, and the slice doesn't outlive it.
+        let slice = unsafe {
+            std::slice::from_raw_parts_mut(obj.as_mut_ptr() as *mut u8, std::mem::size_of::<T>())
+        };
+
+        self.read_exact(slice)?;
+
+        // Safe because obj can be initialized from an array of bytes.
+        Ok(unsafe { obj.assume_init() })
+    }
+}
+
+/// Crate-local extension trait for writing objects and responses into the device-writable section
+/// of a descriptor chain.
+trait WriteToDescriptorChain {
+    /// Write an arbitrary object to the guest.
+    fn write_obj<T: AsBytes>(&mut self, obj: &T) -> IoResult<()>;
+
+    /// Write a command response to the guest.
+    fn write_response<T: AsBytes>(&mut self, response: T) -> IoResult<()> {
+        self.write_obj(&response)
+    }
+
+    /// Send `code` as the error code of an error response.
+    fn write_err_response(&mut self, code: libc::c_int) -> IoResult<()> {
+        self.write_response(RespHeader::err(code))
+    }
+}
+
+/// Any implementor of `Write` can be used to write virtio-media responses.
+impl<W> WriteToDescriptorChain for W
+where
+    W: std::io::Write,
+{
+    fn write_obj<T: AsBytes>(&mut self, obj: &T) -> IoResult<()> {
+        self.write_all(obj.as_bytes())
+    }
+}
+
+impl<Reader, Writer, Device, Poller> VirtioMediaDeviceRunner<Reader, Writer, Device, Poller>
 where
     Reader: std::io::Read,
     Writer: std::io::Write,
     Device: VirtioMediaDevice<Reader, Writer>,
+    Poller: SessionPoller,
 {
     /// Handle a single command from the virtio queue.
     ///
@@ -300,9 +342,27 @@ where
 
                 match self.device.new_session(session_id) {
                     Ok(session) => {
-                        self.session_id_counter += 1;
-                        self.sessions.insert(session_id, session);
-                        writer.write_response(OpenResp::ok(session_id))
+                        if let Some(fd) = session.poll_fd() {
+                            match self.poller.add_session(fd, session_id) {
+                                Ok(()) => {
+                                    self.sessions.insert(session_id, session);
+                                    self.session_id_counter += 1;
+                                    writer.write_response(OpenResp::ok(session_id))
+                                }
+                                Err(e) => {
+                                    log::error!(
+                                        "failed to register poll FD for new session: {}",
+                                        e
+                                    );
+                                    self.device.close_session(session);
+                                    writer.write_err_response(e)
+                                }
+                            }
+                        } else {
+                            self.sessions.insert(session_id, session);
+                            self.session_id_counter += 1;
+                            writer.write_response(OpenResp::ok(session_id))
+                        }
                     }
                     Err(e) => writer.write_err_response(e),
                 }
@@ -314,6 +374,9 @@ where
                 .context("while reading CLOSE command")
                 .map(|CloseCmd { session_id, .. }| {
                     if let Some(session) = self.sessions.remove(&session_id) {
+                        if let Some(fd) = session.poll_fd() {
+                            self.poller.remove_session(fd);
+                        }
                         self.device.close_session(session);
                     }
                 }),
@@ -342,10 +405,16 @@ where
                          flags,
                          offset,
                      }| {
-                        match self.sessions.get_mut(&session_id) {
-                            Some(session) => self.device.do_mmap(session, flags, offset, writer),
-
-                            None => writer.write_err_response(libc::EINVAL),
+                        match self
+                            .sessions
+                            .get_mut(&session_id)
+                            .ok_or(libc::EINVAL)
+                            .and_then(|session| self.device.do_mmap(session, flags, offset))
+                        {
+                            Ok((guest_addr, size)) => {
+                                writer.write_response(MmapResp::ok(guest_addr, size))
+                            }
+                            Err(e) => writer.write_err_response(e),
                         }
                         .context("while writing response for MMAP command")
                     },
@@ -353,10 +422,12 @@ where
             VIRTIO_MEDIA_CMD_MUNMAP => reader
                 .read_obj()
                 .context("while reading UNMMAP command")
-                .and_then(|MunmapCmd { guest_addr }| {
-                    self.device
-                        .do_munmap(guest_addr, writer)
-                        .context("while writing response for MUNMAP command")
+                .and_then(|MunmapCmd { offset: guest_addr }| {
+                    match self.device.do_munmap(guest_addr) {
+                        Ok(()) => writer.write_response(MunmapResp::ok()),
+                        Err(e) => writer.write_err_response(e),
+                    }
+                    .context("while writing response for MUNMAP command")
                 }),
             _ => writer
                 .write_err_response(libc::ENOTTY)
