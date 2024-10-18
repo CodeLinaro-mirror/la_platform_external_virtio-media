@@ -9,6 +9,7 @@
 #ifndef __VIRTIO_MEDIA_H
 #define __VIRTIO_MEDIA_H
 
+#include <linux/virtio_config.h>
 #include <media/v4l2-device.h>
 
 #include "protocol.h"
@@ -30,6 +31,9 @@ struct virtio_media {
 	struct virtqueue *commandq;
 	struct virtqueue *eventq;
 	struct work_struct eventq_work;
+
+	/* Region into which MMAP buffers are mapped by the host. */
+	struct virtio_shm_region mmap_region;
 
 	/* Buffer for event descriptors. */
 	void *event_buffer;
@@ -54,6 +58,9 @@ struct virtio_media {
 
 	/* Protects `cmd_buf` and `resp_buf` */
 	struct mutex bufs_lock;
+
+	/* Used to serialize all virtio commands */
+	struct mutex vlock;
 
 	/* Waitqueue for host responses on the command queue */
 	wait_queue_head_t wq;

@@ -13,6 +13,7 @@
 #include <linux/scatterlist.h>
 #include <linux/types.h>
 #include <linux/videodev2.h>
+#include <linux/vmalloc.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
 #include <media/frame_vector.h>
@@ -35,8 +36,12 @@
 
 #define VIRTIO_MEDIA_NUM_EVENT_BUFS 16
 
-/* High-enough number to not conflict with the official virtio device numbers */
-#define VIRTIO_ID_MEDIA 0x3b
+#ifndef VIRTIO_ID_MEDIA
+#define VIRTIO_ID_MEDIA 49
+#endif
+
+/* ID of the SHM region into which MMAP buffer will be mapped. */
+#define VIRTIO_MEDIA_SHM_MMAP 0
 
 /*
  * Name of the driver to expose to user-space.
@@ -49,7 +54,8 @@ char *driver_name = NULL;
 module_param(driver_name, charp, 0660);
 
 /**
- * Allocate a new session. The id and list fields must still be set by the caller.
+ * Allocate a new session. The id and list fields must still be set by the
+ * caller.
  */
 static struct virtio_media_session *
 virtio_media_session_alloc(struct virtio_media *vv, u32 id,
@@ -63,7 +69,7 @@ virtio_media_session_alloc(struct virtio_media *vv, u32 id,
 	if (!session)
 		goto err_session;
 
-	session->shadow_buf = kzalloc(VIRTIO_BUF_SIZE, GFP_KERNEL);
+	session->shadow_buf = kzalloc(VIRTIO_SHADOW_BUF_SIZE, GFP_KERNEL);
 	if (!session->shadow_buf)
 		goto err_shadow_buf;
 
@@ -349,7 +355,8 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 		if (dqbuf->buffer.length > VIDEO_MAX_PLANES) {
 			v4l2_err(
 				&vv->v4l2_dev,
-				"invalid number of planes received from host for a multiplanar buffer\n");
+				"invalid number of planes received from host for "
+				"a multiplanar buffer\n");
 			return;
 		}
 		for (i = 0; i < dqbuf->buffer.length; i++) {
@@ -364,10 +371,9 @@ virtio_media_process_dqbuf_event(struct virtio_media *vv,
 	dqbuf->buffer.flags |= V4L2_BUF_FLAG_DONE;
 
 	mutex_lock(&session->dqbufs_lock);
-	list_add_tail(&dqbuf->list,
-		      &session->queues[dqbuf->buffer.type].pending_dqbufs);
+	list_add_tail(&dqbuf->list, &queue->pending_dqbufs);
 	mutex_unlock(&session->dqbufs_lock);
-	session->queues[dqbuf->buffer.type].queued_bufs -= 1;
+	queue->queued_bufs -= 1;
 	wake_up(&session->dqbufs_wait);
 }
 
@@ -488,6 +494,8 @@ static int virtio_media_device_open(struct file *file)
 	u32 session_id;
 	int ret;
 
+	mutex_lock(&vv->vlock);
+
 	sg_set_buf(&cmd_sg, cmd_open, sizeof(*cmd_open));
 	sg_mark_end(&cmd_sg);
 
@@ -500,6 +508,7 @@ static int virtio_media_device_open(struct file *file)
 					NULL);
 	session_id = resp_open->session_id;
 	mutex_unlock(&vv->bufs_lock);
+	mutex_unlock(&vv->vlock);
 	if (ret < 0)
 		return ret;
 
@@ -527,6 +536,8 @@ static int virtio_media_device_close(struct file *file)
 	struct scatterlist *sgs[1] = { &cmd_sg };
 	int ret;
 
+	mutex_lock(&vv->vlock);
+
 	cmd_close->hdr.cmd = VIRTIO_MEDIA_CMD_CLOSE;
 	cmd_close->session_id = session->id;
 
@@ -534,6 +545,7 @@ static int virtio_media_device_close(struct file *file)
 	sg_mark_end(&cmd_sg);
 
 	ret = virtio_media_send_command(vv, sgs, 1, 0, 0, NULL);
+	mutex_unlock(&vv->vlock);
 	if (ret < 0)
 		return ret;
 
@@ -565,26 +577,21 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
 	poll_wait(file, &session->dqbufs_wait, wait);
 	poll_wait(file, &session->fh.wait, wait);
 
-	/*
-	 * This function is adequate for m2m devices, however we may need to detect
-	 * the device type and provide variants if this doesn't work with other kinds
-	 * of devices.
-	 */
-
 	mutex_lock(&session->dqbufs_lock);
-	if (req_events & (EPOLLIN | EPOLLRDNORM | EPOLLOUT | EPOLLWRNORM)) {
-		if ((!capture_queue->streaming ||
-		     capture_queue->queued_bufs == 0) &&
-		    (!output_queue->streaming ||
-		     output_queue->queued_bufs == 0)) {
+	if (req_events & (EPOLLIN | EPOLLRDNORM)) {
+		if (!capture_queue->streaming ||
+		    (capture_queue->queued_bufs == 0 &&
+		     list_empty(&capture_queue->pending_dqbufs)))
 			rc |= EPOLLERR;
-		} else {
-			if (!list_empty(&capture_queue->pending_dqbufs))
-				rc |= EPOLLIN | EPOLLRDNORM;
-
-			if (!list_empty(&output_queue->pending_dqbufs))
-				rc |= EPOLLOUT | EPOLLWRNORM;
-		}
+		else if (!list_empty(&capture_queue->pending_dqbufs))
+			rc |= EPOLLIN | EPOLLRDNORM;
+	}
+	if (req_events & (EPOLLOUT | EPOLLWRNORM)) {
+		if (!output_queue->streaming)
+			rc |= EPOLLERR;
+		else if (output_queue->queued_bufs <
+			 output_queue->allocated_bufs)
+			rc |= EPOLLOUT | EPOLLWRNORM;
 	}
 	mutex_unlock(&session->dqbufs_lock);
 
@@ -598,7 +605,7 @@ static __poll_t virtio_media_device_poll(struct file *file, poll_table *wait)
  * Inform the host that a previously created MMAP mapping is no longer needed
  * and can be removed.
  */
-static void virtio_media_vma_close(struct vm_area_struct *vma)
+static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
 {
 	struct virtio_media *vv = vma->vm_private_data;
 	struct virtio_media_cmd_munmap *cmd_munmap = &vv->cmd.munmap;
@@ -615,7 +622,8 @@ static void virtio_media_vma_close(struct vm_area_struct *vma)
 
 	mutex_lock(&vv->bufs_lock);
 	cmd_munmap->hdr.cmd = VIRTIO_MEDIA_CMD_MUNMAP;
-	cmd_munmap->guest_addr = vma->vm_pgoff << PAGE_SHIFT;
+	cmd_munmap->offset =
+		(vma->vm_pgoff << PAGE_SHIFT) - vv->mmap_region.addr;
 	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp_munmap),
 					NULL);
 	mutex_unlock(&vv->bufs_lock);
@@ -623,6 +631,15 @@ static void virtio_media_vma_close(struct vm_area_struct *vma)
 		v4l2_err(&vv->v4l2_dev, "host failed to unmap buffer: %d\n",
 			 ret);
 	}
+}
+
+static void virtio_media_vma_close(struct vm_area_struct *vma)
+{
+	struct virtio_media *vv = vma->vm_private_data;
+
+	mutex_lock(&vv->vlock);
+	virtio_media_vma_close_locked(vma);
+	mutex_unlock(&vv->vlock);
 }
 
 static struct vm_operations_struct virtio_media_vm_ops = {
@@ -653,6 +670,8 @@ static int virtio_media_device_mmap(struct file *file,
 	if (!(vma->vm_flags & (VM_READ | VM_WRITE)))
 		return -EINVAL;
 
+	mutex_lock(&vv->vlock);
+
 	cmd_mmap->hdr.cmd = VIRTIO_MEDIA_CMD_MMAP;
 	cmd_mmap->session_id = session->id;
 	cmd_mmap->flags =
@@ -673,30 +692,33 @@ static int virtio_media_device_mmap(struct file *file,
 	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp_mmap),
 					NULL);
 	if (ret < 0)
-		return ret;
+		goto end;
 
 	vma->vm_private_data = vv;
 	/*
 	 * Keep the guest address at which the buffer is mapped since we will
 	 * use that to unmap.
 	 */
-	vma->vm_pgoff = resp_mmap->addr >> PAGE_SHIFT;
+	vma->vm_pgoff = (resp_mmap->offset + vv->mmap_region.addr) >>
+			PAGE_SHIFT;
 
 	if (vma->vm_end - vma->vm_start > PAGE_ALIGN(resp_mmap->len)) {
-		virtio_media_vma_close(vma);
-		return -EINVAL;
+		virtio_media_vma_close_locked(vma);
+		ret = -EINVAL;
+		goto end;
 	}
 
-	ret = io_remap_pfn_range(vma, vma->vm_start,
-				 resp_mmap->addr >> PAGE_SHIFT,
+	ret = io_remap_pfn_range(vma, vma->vm_start, vma->vm_pgoff,
 				 vma->vm_end - vma->vm_start,
 				 vma->vm_page_prot);
 	if (ret)
-		return ret;
+		goto end;
 
 	vma->vm_ops = &virtio_media_vm_ops;
 
-	return 0;
+end:
+	mutex_unlock(&vv->vlock);
+	return ret;
 }
 
 static const struct v4l2_file_operations virtio_media_fops = {
@@ -712,11 +734,24 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 {
 	struct device *dev = &virtio_dev->dev;
 	struct virtqueue *vqs[2];
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+	static struct virtqueue_info vq_info[2] = {
+		{
+			.name = "command",
+			.callback = commandq_callback,
+		},
+		{
+			.name = "event",
+			.callback = eventq_callback,
+		},
+	};
+#else
 	static vq_callback_t *vq_callbacks[] = {
 		commandq_callback,
 		eventq_callback,
 	};
 	static const char *const vq_names[] = { "command", "event" };
+#endif
 	struct virtio_media *vv;
 	struct video_device *vd;
 	int i;
@@ -738,6 +773,7 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	INIT_LIST_HEAD(&vv->sessions);
 	mutex_init(&vv->sessions_lock);
 	mutex_init(&vv->events_process_lock);
+	mutex_init(&vv->vlock);
 
 	vv->virtio_dev = virtio_dev;
 	virtio_dev->priv = vv;
@@ -748,13 +784,21 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	if (ret)
 		return ret;
 
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 11, 0)
+	ret = virtio_find_vqs(virtio_dev, 2, vqs, vq_info, NULL);
+#else
 	ret = virtio_find_vqs(virtio_dev, 2, vqs, vq_callbacks, vq_names, NULL);
+#endif
 	if (ret)
 		goto err_find_vqs;
 
 	vv->commandq = vqs[0];
 	vv->eventq = vqs[1];
 	INIT_WORK(&vv->eventq_work, virtio_media_event_work);
+
+	/* Get MMAP buffer mapping SHM region */
+	virtio_get_shm_region(virtio_dev, &vv->mmap_region,
+			      VIRTIO_MEDIA_SHM_MMAP);
 
 	virtio_device_ready(virtio_dev);
 
@@ -766,10 +810,10 @@ static int virtio_media_probe(struct virtio_device *virtio_dev)
 	vd->fops = &virtio_media_fops;
 	vd->device_caps = virtio_cread32(virtio_dev, 0);
 	if (vd->device_caps & (V4L2_CAP_VIDEO_M2M | V4L2_CAP_VIDEO_M2M_MPLANE))
-		vd->vfl_dir |= VFL_DIR_M2M;
+		vd->vfl_dir = VFL_DIR_M2M;
 	else if (vd->device_caps &
 		 (V4L2_CAP_VIDEO_OUTPUT | V4L2_BUF_TYPE_VIDEO_OUTPUT_MPLANE))
-		vd->vfl_dir |= VFL_DIR_TX;
+		vd->vfl_dir = VFL_DIR_TX;
 	else
 		vd->vfl_dir = VFL_DIR_RX;
 	vd->release = video_device_release_empty;
@@ -843,5 +887,5 @@ module_virtio_driver(virtio_media_driver);
 
 MODULE_DEVICE_TABLE(virtio, id_table);
 MODULE_DESCRIPTION("virtio media driver");
-MODULE_AUTHOR("Alexandre Courbot <acourbot@chromium.org>");
+MODULE_AUTHOR("Alexandre Courbot <acourbot@google.com>");
 MODULE_LICENSE("Dual BSD/GPL");

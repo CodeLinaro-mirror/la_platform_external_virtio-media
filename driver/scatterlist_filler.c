@@ -158,8 +158,9 @@ int scatterlist_filler_retrieve_data(struct virtio_media_session *session,
 	 * If our SG entry points inside the shadow buffer, copy the data back to its
 	 * origin.
 	 */
-	if (kaddr >= shadow_buf && kaddr < shadow_buf + VIRTIO_BUF_SIZE) {
-		if (kaddr + len >= shadow_buf + VIRTIO_BUF_SIZE)
+	if (kaddr >= shadow_buf &&
+	    kaddr < shadow_buf + VIRTIO_SHADOW_BUF_SIZE) {
+		if (kaddr + len >= shadow_buf + VIRTIO_SHADOW_BUF_SIZE)
 			return -EINVAL;
 
 		BUG_ON(sg->length != len);
@@ -178,7 +179,6 @@ int scatterlist_filler_retrieve_data(struct virtio_media_session *session,
  */
 int scatterlist_filler_retrieve_buffer(struct virtio_media_session *session,
 				       struct scatterlist **buffer_sgs,
-				       const int num_buffer_sgs,
 				       struct v4l2_buffer *b, size_t num_planes)
 {
 	struct v4l2_plane *planes = NULL;
@@ -207,10 +207,6 @@ int scatterlist_filler_retrieve_buffer(struct virtio_media_session *session,
 			return ret;
 	}
 
-	/* If our buffer is a USERPTR one, a few SG list we need to free may follow. */
-	while (i < num_buffer_sgs)
-		kfree(sg_virt(buffer_sgs[i++]));
-
 	return 0;
 }
 
@@ -238,10 +234,6 @@ int scatterlist_filler_retrieve_ext_ctrls(struct virtio_media_session *session,
 			return ret;
 	}
 
-	/* A few SG list with controls payloads may follow. */
-	while (i < num_ctrls_sgs)
-		kfree(sg_virt(ctrls_sgs[i++]));
-
 	return 0;
 }
 
@@ -252,7 +244,8 @@ int scatterlist_filler_retrieve_ext_ctrls(struct virtio_media_session *session,
  * the driver should consider as "normal" operation. All other failures signal
  * a problem with the driver.
  */
-static int prepare_userptr_to_host(unsigned long userptr, unsigned long length,
+static int prepare_userptr_to_host(struct scatterlist_filler *filler,
+				   unsigned long userptr, unsigned long length,
 				   struct virtio_media_sg_entry **sg_list,
 				   int *nents)
 {
@@ -262,6 +255,7 @@ static int prepare_userptr_to_host(unsigned long userptr, unsigned long length,
 	struct page **pages;
 	unsigned int pages_count;
 	unsigned int offset = userptr & ~PAGE_MASK;
+	size_t entries_size;
 	int i;
 	int ret;
 
@@ -292,16 +286,17 @@ static int prepare_userptr_to_host(unsigned long userptr, unsigned long length,
 		goto done;
 	}
 
-	/* 
-	 * Allocate our actual SG list. This will be freed by
-	 * scatterlist_filler_retrieve_(buffer|ext_ctrls).
-	 */
+	/* Allocate our actual SG in the shadow buffer. */
 	*nents = sg_nents(sg_table.sgl);
-	*sg_list = kzalloc(sizeof(**sg_list) * *nents, GFP_KERNEL);
-	if (!*sg_list) {
+	entries_size = sizeof(**sg_list) * *nents;
+	if (filler->shadow_buffer_pos + entries_size >
+	    filler->shadow_buffer_size) {
 		ret = -ENOMEM;
 		goto free_sg;
 	}
+
+	*sg_list = filler->shadow_buffer + filler->shadow_buffer_pos;
+	filler->shadow_buffer_pos += entries_size;
 
 	for_each_sgtable_sg(&sg_table, sg_iter, i) {
 		struct virtio_media_sg_entry *sg_entry = &(*sg_list)[i];
@@ -325,7 +320,8 @@ static int scatterlist_filler_add_userptr(struct scatterlist_filler *filler,
 	int nents;
 	struct virtio_media_sg_entry *sg_list;
 
-	ret = prepare_userptr_to_host(userptr, length, &sg_list, &nents);
+	ret = prepare_userptr_to_host(filler, userptr, length, &sg_list,
+				      &nents);
 	if (ret)
 		return ret;
 
@@ -338,7 +334,7 @@ static int scatterlist_filler_add_userptr(struct scatterlist_filler *filler,
 }
 
 int scatterlist_filler_add_buffer(struct scatterlist_filler *filler,
-				  struct v4l2_buffer *b, bool add_userptr)
+				  struct v4l2_buffer *b)
 {
 	int i;
 	int ret;
@@ -370,12 +366,25 @@ int scatterlist_filler_add_buffer(struct scatterlist_filler *filler,
 							  b->length);
 		if (ret)
 			return ret;
+	}
 
-		/* USERPTR memory buffers */
+	return 0;
+}
+
+int scatterlist_filler_add_buffer_userptr(struct scatterlist_filler *filler,
+					  struct v4l2_buffer *b)
+{
+	int i;
+	int ret;
+
+	if (b->memory != V4L2_MEMORY_USERPTR)
+		return 0;
+
+	if (V4L2_TYPE_IS_MULTIPLANAR(b->type)) {
 		for (i = 0; i < b->length; i++) {
 			struct v4l2_plane *plane = &b->m.planes[i];
 			if (b->memory == V4L2_MEMORY_USERPTR &&
-			    plane->length > 0 && add_userptr) {
+			    plane->length > 0) {
 				ret = scatterlist_filler_add_userptr(
 					filler, plane->m.userptr,
 					plane->length);
@@ -383,10 +392,7 @@ int scatterlist_filler_add_buffer(struct scatterlist_filler *filler,
 					return ret;
 			}
 		}
-	} else if (!V4L2_TYPE_IS_MULTIPLANAR(b->type) &&
-		   b->memory == V4L2_MEMORY_USERPTR && b->length > 0 &&
-		   add_userptr) {
-		/* USERPTR memory buffer for single-planar buffers */
+	} else if (b->length > 0) {
 		ret = scatterlist_filler_add_userptr(filler, b->m.userptr,
 						     b->length);
 		if (ret)
