@@ -42,7 +42,6 @@ use v4l2r::ioctl::AudioMode;
 use v4l2r::ioctl::CtrlId;
 use v4l2r::ioctl::CtrlWhich;
 use v4l2r::ioctl::EventType as V4l2EventType;
-use v4l2r::ioctl::QueryBuf;
 use v4l2r::ioctl::QueryCtrlFlags;
 use v4l2r::ioctl::SelectionFlags;
 use v4l2r::ioctl::SelectionTarget;
@@ -51,7 +50,9 @@ use v4l2r::ioctl::SubscribeEventFlags;
 use v4l2r::ioctl::TunerMode;
 use v4l2r::ioctl::TunerTransmissionFlags;
 use v4l2r::ioctl::TunerType;
+use v4l2r::ioctl::UncheckedV4l2Buffer;
 use v4l2r::ioctl::V4l2Buffer;
+use v4l2r::ioctl::V4l2PlanesWithBacking;
 use v4l2r::memory::MemoryType;
 use v4l2r::QueueDirection;
 use v4l2r::QueueType;
@@ -60,9 +61,9 @@ use crate::protocol::RespHeader;
 use crate::protocol::SgEntry;
 use crate::protocol::V4l2Ioctl;
 use crate::FromDescriptorChain;
-use crate::ReadDescriptorChain;
+use crate::ReadFromDescriptorChain;
 use crate::ToDescriptorChain;
-use crate::WriteDescriptorChain;
+use crate::WriteToDescriptorChain;
 
 /// Module allowing select V4L2 structures from implementing zerocopy and implementations of
 /// [`FromDescriptorChain`] and [`ToDescriptorChain`] for them.
@@ -73,7 +74,7 @@ mod v4l2_zerocopy {
     use zerocopy::FromZeroes;
 
     use crate::FromDescriptorChain;
-    use crate::ReadDescriptorChain;
+    use crate::ReadFromDescriptorChain;
     use crate::ToDescriptorChain;
 
     /// Wrapper allowing any structure to be read/written using zerocopy. This obviously should be
@@ -195,18 +196,22 @@ pub trait VirtioMediaIoctlHandler {
 
     fn enum_fmt(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         queue: QueueType,
         index: u32,
     ) -> IoctlResult<v4l2_fmtdesc> {
         unhandled_ioctl!()
     }
-    fn g_fmt(&mut self, session: &mut Self::Session, queue: QueueType) -> IoctlResult<v4l2_format> {
+    fn g_fmt(&mut self, session: &Self::Session, queue: QueueType) -> IoctlResult<v4l2_format> {
         unhandled_ioctl!()
     }
+    /// Hook for the `VIDIOC_S_FMT` ioctl.
+    ///
+    /// `queue` is guaranteed to match `format.type_`.
     fn s_fmt(
         &mut self,
         session: &mut Self::Session,
+        queue: QueueType,
         format: v4l2_format,
     ) -> IoctlResult<v4l2_format> {
         unhandled_ioctl!()
@@ -222,7 +227,7 @@ pub trait VirtioMediaIoctlHandler {
     }
     fn querybuf(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         queue: QueueType,
         index: u32,
     ) -> IoctlResult<V4l2Buffer> {
@@ -250,7 +255,7 @@ pub trait VirtioMediaIoctlHandler {
 
     fn g_parm(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         queue: QueueType,
     ) -> IoctlResult<v4l2_streamparm> {
         unhandled_ioctl!()
@@ -263,7 +268,7 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    fn g_std(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_std_id> {
+    fn g_std(&mut self, session: &Self::Session) -> IoctlResult<v4l2_std_id> {
         unhandled_ioctl!()
     }
 
@@ -271,15 +276,15 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    fn enumstd(&mut self, session: &mut Self::Session, index: u32) -> IoctlResult<v4l2_standard> {
+    fn enumstd(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_standard> {
         unhandled_ioctl!()
     }
 
-    fn enuminput(&mut self, session: &mut Self::Session, index: u32) -> IoctlResult<v4l2_input> {
+    fn enuminput(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_input> {
         unhandled_ioctl!()
     }
 
-    fn g_ctrl(&mut self, session: &mut Self::Session, id: u32) -> IoctlResult<v4l2_control> {
+    fn g_ctrl(&mut self, session: &Self::Session, id: u32) -> IoctlResult<v4l2_control> {
         unhandled_ioctl!()
     }
 
@@ -292,7 +297,7 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    fn g_tuner(&mut self, session: &mut Self::Session, index: u32) -> IoctlResult<v4l2_tuner> {
+    fn g_tuner(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_tuner> {
         unhandled_ioctl!()
     }
 
@@ -305,7 +310,7 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    fn g_audio(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_audio> {
+    fn g_audio(&mut self, session: &Self::Session) -> IoctlResult<v4l2_audio> {
         unhandled_ioctl!()
     }
 
@@ -320,7 +325,7 @@ pub trait VirtioMediaIoctlHandler {
 
     fn queryctrl(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         id: CtrlId,
         flags: QueryCtrlFlags,
     ) -> IoctlResult<v4l2_queryctrl> {
@@ -329,14 +334,14 @@ pub trait VirtioMediaIoctlHandler {
 
     fn querymenu(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         id: u32,
         index: u32,
     ) -> IoctlResult<v4l2_querymenu> {
         unhandled_ioctl!()
     }
 
-    fn g_input(&mut self, session: &mut Self::Session) -> IoctlResult<i32> {
+    fn g_input(&mut self, session: &Self::Session) -> IoctlResult<i32> {
         unhandled_ioctl!()
     }
 
@@ -344,7 +349,7 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    fn g_output(&mut self, session: &mut Self::Session) -> IoctlResult<i32> {
+    fn g_output(&mut self, session: &Self::Session) -> IoctlResult<i32> {
         unhandled_ioctl!()
     }
 
@@ -352,11 +357,11 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    fn enumoutput(&mut self, session: &mut Self::Session, index: u32) -> IoctlResult<v4l2_output> {
+    fn enumoutput(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_output> {
         unhandled_ioctl!()
     }
 
-    fn g_audout(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_audioout> {
+    fn g_audout(&mut self, session: &Self::Session) -> IoctlResult<v4l2_audioout> {
         unhandled_ioctl!()
     }
 
@@ -364,11 +369,7 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    fn g_modulator(
-        &mut self,
-        session: &mut Self::Session,
-        index: u32,
-    ) -> IoctlResult<v4l2_modulator> {
+    fn g_modulator(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_modulator> {
         unhandled_ioctl!()
     }
 
@@ -381,11 +382,7 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    fn g_frequency(
-        &mut self,
-        session: &mut Self::Session,
-        tuner: u32,
-    ) -> IoctlResult<v4l2_frequency> {
+    fn g_frequency(&mut self, session: &Self::Session, tuner: u32) -> IoctlResult<v4l2_frequency> {
         unhandled_ioctl!()
     }
 
@@ -399,34 +396,34 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    fn querystd(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_std_id> {
+    fn querystd(&mut self, session: &Self::Session) -> IoctlResult<v4l2_std_id> {
         unhandled_ioctl!()
     }
 
+    /// Hook for the `VIDIOC_TRY_FMT` ioctl.
+    ///
+    /// `queue` is guaranteed to match `format.type_`.
     fn try_fmt(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
+        queue: QueueType,
         format: v4l2_format,
     ) -> IoctlResult<v4l2_format> {
         unhandled_ioctl!()
     }
 
-    fn enumaudio(&mut self, session: &mut Self::Session, index: u32) -> IoctlResult<v4l2_audio> {
+    fn enumaudio(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_audio> {
         unhandled_ioctl!()
     }
 
-    fn enumaudout(
-        &mut self,
-        session: &mut Self::Session,
-        index: u32,
-    ) -> IoctlResult<v4l2_audioout> {
+    fn enumaudout(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_audioout> {
         unhandled_ioctl!()
     }
 
     /// Ext control ioctls modify `ctrls` and `ctrl_array` in place instead of returning them.
     fn g_ext_ctrls(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         which: CtrlWhich,
         ctrls: &mut v4l2_ext_controls,
         ctrl_array: &mut Vec<v4l2_ext_control>,
@@ -448,7 +445,7 @@ pub trait VirtioMediaIoctlHandler {
     /// Ext control ioctls modify `ctrls` and `ctrl_array` in place instead of returning them.
     fn try_ext_ctrls(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         which: CtrlWhich,
         ctrls: &mut v4l2_ext_controls,
         ctrl_array: &mut Vec<v4l2_ext_control>,
@@ -459,7 +456,7 @@ pub trait VirtioMediaIoctlHandler {
 
     fn enum_framesizes(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         index: u32,
         pixel_format: u32,
     ) -> IoctlResult<v4l2_frmsizeenum> {
@@ -468,7 +465,7 @@ pub trait VirtioMediaIoctlHandler {
 
     fn enum_frameintervals(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         index: u32,
         pixel_format: u32,
         width: u32,
@@ -477,7 +474,7 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    fn g_enc_index(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_enc_idx> {
+    fn g_enc_index(&mut self, session: &Self::Session) -> IoctlResult<v4l2_enc_idx> {
         unhandled_ioctl!()
     }
 
@@ -491,7 +488,7 @@ pub trait VirtioMediaIoctlHandler {
 
     fn try_encoder_cmd(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         cmd: v4l2_encoder_cmd,
     ) -> IoctlResult<v4l2_encoder_cmd> {
         unhandled_ioctl!()
@@ -505,7 +502,7 @@ pub trait VirtioMediaIoctlHandler {
         unhandled_ioctl!()
     }
 
-    fn g_dv_timings(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_dv_timings> {
+    fn g_dv_timings(&mut self, session: &Self::Session) -> IoctlResult<v4l2_dv_timings> {
         unhandled_ioctl!()
     }
 
@@ -553,7 +550,7 @@ pub trait VirtioMediaIoctlHandler {
 
     fn g_selection(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         sel_type: SelectionType,
         sel_target: SelectionTarget,
     ) -> IoctlResult<v4l2_rect> {
@@ -581,7 +578,7 @@ pub trait VirtioMediaIoctlHandler {
 
     fn try_decoder_cmd(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         cmd: v4l2_decoder_cmd,
     ) -> IoctlResult<v4l2_decoder_cmd> {
         unhandled_ioctl!()
@@ -589,23 +586,23 @@ pub trait VirtioMediaIoctlHandler {
 
     fn enum_dv_timings(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         index: u32,
     ) -> IoctlResult<v4l2_dv_timings> {
         unhandled_ioctl!()
     }
 
-    fn query_dv_timings(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_dv_timings> {
+    fn query_dv_timings(&mut self, session: &Self::Session) -> IoctlResult<v4l2_dv_timings> {
         unhandled_ioctl!()
     }
 
-    fn dv_timings_cap(&self, session: &mut Self::Session) -> IoctlResult<v4l2_dv_timings_cap> {
+    fn dv_timings_cap(&self, session: &Self::Session) -> IoctlResult<v4l2_dv_timings_cap> {
         unhandled_ioctl!()
     }
 
     fn enum_freq_bands(
         &self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         tuner: u32,
         type_: TunerType,
         index: u32,
@@ -615,7 +612,7 @@ pub trait VirtioMediaIoctlHandler {
 
     fn query_ext_ctrl(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         id: CtrlId,
         flags: QueryCtrlFlags,
     ) -> IoctlResult<v4l2_query_ext_ctrl> {
@@ -683,30 +680,20 @@ impl FromDescriptorChain for (V4l2Buffer, Vec<Vec<SgEntry>>) {
             None
         };
 
-        let v4l2_buffer = V4l2Buffer::try_from_v4l2_buffer(v4l2_buffer, v4l2_planes)
+        let v4l2_buffer = V4l2Buffer::try_from(UncheckedV4l2Buffer(v4l2_buffer, v4l2_planes))
             .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?;
 
         // Read the `MemRegion`s of all planes if the buffer is `USERPTR`.
-        let guest_regions = if v4l2_buffer.memory() == MemoryType::UserPtr
-            && v4l2_buffer.v4l2_buffer().length > 0
+        let guest_regions = if let V4l2PlanesWithBacking::UserPtr(planes) =
+            v4l2_buffer.planes_with_backing_iter()
         {
-            if queue.is_multiplanar() {
-                v4l2_buffer
-                    .v4l2_plane_iter()
-                    .filter(|p| p.length > 0)
-                    .map(|p| {
-                        get_userptr_regions(reader, p.length as usize)
-                            .map_err(|_| std::io::ErrorKind::InvalidData.into())
-                    })
-                    .collect::<IoResult<Vec<_>>>()?
-            } else if !queue.is_multiplanar() {
-                vec![
-                    get_userptr_regions(reader, v4l2_buffer.v4l2_buffer().length as usize)
-                        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidData))?,
-                ]
-            } else {
-                vec![]
-            }
+            planes
+                .filter(|p| *p.length > 0)
+                .map(|p| {
+                    get_userptr_regions(reader, *p.length as usize)
+                        .map_err(|_| std::io::ErrorKind::InvalidData.into())
+                })
+                .collect::<IoResult<Vec<_>>>()?
         } else {
             vec![]
         };
@@ -719,16 +706,18 @@ impl FromDescriptorChain for (V4l2Buffer, Vec<Vec<SgEntry>>) {
 /// larger than a limit (i.e. the maximum number of planes that the descriptor chain can receive).
 impl ToDescriptorChain for (V4l2Buffer, usize) {
     fn write_to_chain<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        let buffer = &self.0;
-        let num_planes = std::cmp::min(buffer.num_planes(), self.1);
+        let mut v4l2_buffer = *self.0.as_v4l2_buffer();
+        // If the buffer is multiplanar, nullify the `planes` pointer to avoid leaking host
+        // addresses.
+        if self.0.queue().is_multiplanar() {
+            v4l2_buffer.m.planes = std::ptr::null_mut();
+        }
+        v4l2_buffer.write_to_chain(writer)?;
 
-        self.0.v4l2_buffer().write_to_chain(writer)?;
-
-        // Write plane information if the queue is multiplanar.
-        if self.0.queue_type().is_multiplanar() {
-            for plane in self.0.v4l2_plane_iter().take(num_planes) {
-                plane.write_to_chain(writer)?;
-            }
+        // Write plane information if the buffer is multiplanar. Limit the number of planes to the
+        // upper bound we were given.
+        for plane in self.0.as_v4l2_planes().iter().take(self.1) {
+            plane.write_to_chain(writer)?;
         }
 
         Ok(())
@@ -767,7 +756,10 @@ impl FromDescriptorChain for (v4l2_ext_controls, Vec<v4l2_ext_control>, Vec<Vec<
 impl ToDescriptorChain for (v4l2_ext_controls, Vec<v4l2_ext_control>) {
     fn write_to_chain<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
         let (ctrls, ctrl_array) = self;
+        let mut ctrls = *ctrls;
 
+        // Nullify the control pointer to avoid leaking host addresses.
+        ctrls.controls = std::ptr::null_mut();
         ctrls.write_to_chain(writer)?;
 
         for ctrl in ctrl_array {
@@ -784,9 +776,9 @@ impl ToDescriptorChain for (v4l2_ext_controls, Vec<v4l2_ext_control>) {
 /// * `Writer` is the writer to the device-writable part of the descriptor chain,
 /// * `I` is the data to be read from the descriptor chain,
 /// * `O` is the type of response to be written to the descriptor chain for both success and
-/// failure,
+///   failure,
 /// * `X` processes the input and produces a result. In case of failure, an error code and optional
-/// payload to write along with it are returned.
+///   payload to write along with it are returned.
 fn wr_ioctl_with_err_payload<Reader, Writer, I, O, X>(
     ioctl: V4l2Ioctl,
     reader: &mut Reader,
@@ -828,7 +820,7 @@ where
 /// * `I` is the data to be read from the descriptor chain,
 /// * `O` is the type of response to be written to the descriptor chain in case of success,
 /// * `X` processes the input and produces a result. In case of failure, an error code to transmit
-/// to the guest is returned.
+///   to the guest is returned.
 fn wr_ioctl<Reader, Writer, I, O, X>(
     ioctl: V4l2Ioctl,
     reader: &mut Reader,
@@ -852,7 +844,7 @@ where
 /// * `Reader` is the reader to the device-readable part of the descriptor chain,
 /// * `I` is the data to be read from the descriptor chain,
 /// * `X` processes the input. In case of failure, an error code to transmit to the guest is
-/// returned.
+///   returned.
 fn w_ioctl<Reader, Writer, I, X>(
     ioctl: V4l2Ioctl,
     reader: &mut Reader,
@@ -873,7 +865,7 @@ where
 /// * `Writer` is the writer to the device-writable part of the descriptor chain,
 /// * `O` is the type of response to be written to the descriptor chain in case of success,
 /// * `X` runs the ioctl and produces a result. In case of failure, an error code to transmit to
-/// the guest is returned.
+///   the guest is returned.
 fn r_ioctl<Writer, O, X>(ioctl: V4l2Ioctl, writer: &mut Writer, process: X) -> IoResult<()>
 where
     Writer: std::io::Write,
@@ -929,8 +921,8 @@ where
             handler.g_fmt(session, queue)
         }),
         VIDIOC_S_FMT => wr_ioctl(ioctl, reader, writer, |format: v4l2_format| {
-            let _ = QueueType::n(format.type_).ok_or(libc::EINVAL)?;
-            handler.s_fmt(session, format)
+            let queue = QueueType::n(format.type_).ok_or(libc::EINVAL)?;
+            handler.s_fmt(session, queue, format)
         }),
         VIDIOC_REQBUFS => wr_ioctl(ioctl, reader, writer, |reqbufs: v4l2_requestbuffers| {
             let queue = QueueType::n(reqbufs.type_).ok_or(libc::EINVAL)?;
@@ -1075,7 +1067,8 @@ where
         VIDIOC_S_JPEGCOMP => invalid_ioctl(ioctl, writer),
         VIDIOC_QUERYSTD => r_ioctl(ioctl, writer, || handler.querystd(session)),
         VIDIOC_TRY_FMT => wr_ioctl(ioctl, reader, writer, |format: v4l2_format| {
-            handler.try_fmt(session, format)
+            let queue = QueueType::n(format.type_).ok_or(libc::EINVAL)?;
+            handler.try_fmt(session, queue, format)
         }),
         VIDIOC_ENUMAUDIO => wr_ioctl(ioctl, reader, writer, |audio: v4l2_audio| {
             handler.enumaudio(session, audio.index)

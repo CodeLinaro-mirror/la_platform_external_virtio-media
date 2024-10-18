@@ -7,6 +7,7 @@
  */
 
 #include <linux/virtio_config.h>
+#include <linux/vmalloc.h>
 #include <media/v4l2-event.h>
 #include <media/v4l2-ioctl.h>
 
@@ -20,8 +21,7 @@
  * Returns 0 in case of success, or a negative error code.
  */
 static int virtio_media_send_r_ioctl(struct v4l2_fh *fh, u32 ioctl,
-				     const void *ioctl_data,
-				     size_t ioctl_data_len)
+				     void *ioctl_data, size_t ioctl_data_len)
 {
 	struct video_device *video_dev = fh->vdev;
 	struct virtio_media *vv = to_virtio_media(video_dev);
@@ -32,7 +32,7 @@ static int virtio_media_send_r_ioctl(struct v4l2_fh *fh, u32 ioctl,
 		.num_descs = DESC_CHAIN_MAX_LEN,
 		.cur_desc = 0,
 		.shadow_buffer = session->shadow_buf,
-		.shadow_buffer_size = VIRTIO_BUF_SIZE,
+		.shadow_buffer_size = VIRTIO_SHADOW_BUF_SIZE,
 		.shadow_buffer_pos = 0,
 		.sgs = sgs,
 		.num_sgs = ARRAY_SIZE(sgs),
@@ -51,8 +51,7 @@ static int virtio_media_send_r_ioctl(struct v4l2_fh *fh, u32 ioctl,
 		return ret;
 
 	/* Response payload */
-	ret = scatterlist_filler_add_data(&filler, (void *)ioctl_data,
-					  ioctl_data_len);
+	ret = scatterlist_filler_add_data(&filler, ioctl_data, ioctl_data_len);
 	if (ret) {
 		v4l2_err(&vv->v4l2_dev,
 			 "failed to prepare command descriptor chain\n");
@@ -64,6 +63,14 @@ static int virtio_media_send_r_ioctl(struct v4l2_fh *fh, u32 ioctl,
 		sizeof(struct virtio_media_resp_ioctl) + ioctl_data_len, NULL);
 	if (ret < 0)
 		return ret;
+
+	ret = scatterlist_filler_retrieve_data(session, filler.sgs[2],
+					       ioctl_data, ioctl_data_len);
+	if (ret) {
+		v4l2_err(&vv->v4l2_dev,
+			 "failed to retrieve response descriptor chain\n");
+		return ret;
+	}
 
 	return 0;
 }
@@ -86,7 +93,7 @@ static int virtio_media_send_w_ioctl(struct v4l2_fh *fh, u32 ioctl,
 		.num_descs = DESC_CHAIN_MAX_LEN,
 		.cur_desc = 0,
 		.shadow_buffer = session->shadow_buf,
-		.shadow_buffer_size = VIRTIO_BUF_SIZE,
+		.shadow_buffer_size = VIRTIO_SHADOW_BUF_SIZE,
 		.shadow_buffer_pos = 0,
 		.sgs = sgs,
 		.num_sgs = ARRAY_SIZE(sgs),
@@ -147,7 +154,7 @@ static int virtio_media_send_wr_ioctl(struct v4l2_fh *fh, u32 ioctl,
 		.num_descs = DESC_CHAIN_MAX_LEN,
 		.cur_desc = 0,
 		.shadow_buffer = session->shadow_buf,
-		.shadow_buffer_size = VIRTIO_BUF_SIZE,
+		.shadow_buffer_size = VIRTIO_SHADOW_BUF_SIZE,
 		.shadow_buffer_pos = 0,
 		.sgs = sgs,
 		.num_sgs = ARRAY_SIZE(sgs),
@@ -161,8 +168,7 @@ static int virtio_media_send_wr_ioctl(struct v4l2_fh *fh, u32 ioctl,
 		return ret;
 
 	/* Command payload */
-	ret = scatterlist_filler_add_data(&filler, (void *)ioctl_data,
-					  ioctl_data_len);
+	ret = scatterlist_filler_add_data(&filler, ioctl_data, ioctl_data_len);
 	if (ret) {
 		v4l2_err(&vv->v4l2_dev,
 			 "failed to prepare command descriptor chain\n");
@@ -186,7 +192,7 @@ static int virtio_media_send_wr_ioctl(struct v4l2_fh *fh, u32 ioctl,
 	if (ret < 0)
 		return ret;
 
-	ret = scatterlist_filler_retrieve_data(session, filler.sgs[1],
+	ret = scatterlist_filler_retrieve_data(session, filler.sgs[3],
 					       ioctl_data, ioctl_data_len);
 	if (ret) {
 		v4l2_err(&vv->v4l2_dev,
@@ -206,13 +212,15 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl_code,
 	struct v4l2_plane *planes_backup = NULL;
 	u32 length_backup = 0;
 	struct scatterlist *sgs[64];
+	/* End of the device-readable buffer SGs, to reuse in device-writable section. */
 	size_t num_cmd_sgs;
+	size_t end_buf_sg;
 	struct scatterlist_filler filler = {
 		.descs = session->command_sgs.sgl,
 		.num_descs = DESC_CHAIN_MAX_LEN,
 		.cur_desc = 0,
 		.shadow_buffer = session->shadow_buf,
-		.shadow_buffer_size = VIRTIO_BUF_SIZE,
+		.shadow_buffer_size = VIRTIO_SHADOW_BUF_SIZE,
 		.shadow_buffer_pos = 0,
 		.sgs = sgs,
 		.num_sgs = ARRAY_SIZE(sgs),
@@ -220,6 +228,7 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl_code,
 	};
 	size_t resp_len;
 	int ret;
+	int i;
 
 	if (b->type > VIRTIO_MEDIA_LAST_QUEUE)
 		return -EINVAL;
@@ -235,7 +244,14 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl_code,
 		return ret;
 
 	/* Command payload (struct v4l2_buffer) */
-	ret = scatterlist_filler_add_buffer(&filler, b, true);
+	ret = scatterlist_filler_add_buffer(&filler, b);
+	if (ret < 0)
+		return ret;
+
+	end_buf_sg = filler.cur_sg;
+
+	/* Payload of USERPTR buffers, if relevant */
+	ret = scatterlist_filler_add_buffer_userptr(&filler, b);
 	if (ret < 0)
 		return ret;
 
@@ -247,9 +263,11 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl_code,
 		return ret;
 
 	/* Response payload (same as input, but no userptr mapping) */
-	ret = scatterlist_filler_add_buffer(&filler, b, false);
-	if (ret < 0)
-		return ret;
+	for (i = 1; i < end_buf_sg; i++) {
+		ret = scatterlist_filler_add_sg(&filler, filler.sgs[i]);
+		if (ret < 0)
+			return ret;
+	}
 
 	ret = virtio_media_send_command(
 		vv, filler.sgs, num_cmd_sgs, filler.cur_sg - num_cmd_sgs,
@@ -270,8 +288,8 @@ static int virtio_media_send_buffer_ioctl(struct v4l2_fh *fh, u32 ioctl_code,
 	if (resp_len < sizeof(*b))
 		return -EINVAL;
 
-	ret = scatterlist_filler_retrieve_buffer(
-		session, &sgs[1], num_cmd_sgs - 1, b, length_backup);
+	ret = scatterlist_filler_retrieve_buffer(session, &sgs[num_cmd_sgs + 1],
+						 b, length_backup);
 	if (ret) {
 		v4l2_err(&vv->v4l2_dev,
 			 "failed to retrieve response descriptor chain\n");
@@ -312,7 +330,7 @@ static int virtio_media_send_ext_controls_ioctl(struct v4l2_fh *fh,
 		.num_descs = DESC_CHAIN_MAX_LEN,
 		.cur_desc = 0,
 		.shadow_buffer = session->shadow_buf,
-		.shadow_buffer_size = VIRTIO_BUF_SIZE,
+		.shadow_buffer_size = VIRTIO_SHADOW_BUF_SIZE,
 		.shadow_buffer_pos = 0,
 		.sgs = sgs,
 		.num_sgs = ARRAY_SIZE(sgs),
@@ -364,8 +382,9 @@ static int virtio_media_send_ext_controls_ioctl(struct v4l2_fh *fh,
 	if (ret < 0 && resp_len >= sizeof(struct virtio_media_resp_ioctl) +
 					   sizeof(*ctrls)) {
 		/* Deliberately ignore the error here as we want to return the previous one */
-		scatterlist_filler_retrieve_ext_ctrls(session, &sgs[1],
-						      num_cmd_sgs - 1, ctrls);
+		scatterlist_filler_retrieve_ext_ctrls(
+			session, &sgs[num_cmd_sgs + 1],
+			filler.cur_sg - (num_cmd_sgs + 1), ctrls);
 		return ret;
 	}
 
@@ -375,8 +394,9 @@ static int virtio_media_send_ext_controls_ioctl(struct v4l2_fh *fh,
 	if (resp_len < sizeof(*ctrls))
 		return -EINVAL;
 
-	ret = scatterlist_filler_retrieve_ext_ctrls(session, &sgs[1],
-						    num_cmd_sgs - 1, ctrls);
+	ret = scatterlist_filler_retrieve_ext_ctrls(
+		session, &sgs[num_cmd_sgs + 1],
+		filler.cur_sg - (num_cmd_sgs + 1), ctrls);
 	if (ret)
 		return ret;
 
@@ -867,6 +887,8 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 {
 	struct virtio_media_session *session =
 		fh_to_session(file->private_data);
+	struct video_device *video_dev = video_devdata(file);
+	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct virtio_media_buffer *dqbuf;
 	struct virtio_media_queue_state *queue;
 	struct list_head *buffer_queue;
@@ -888,7 +910,6 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 
 	buffer_queue = &queue->pending_dqbufs;
 
-	/* Only block for a buffer if the file has been opened with O_NONBLOCK. */
 	if (session->nonblocking_dequeue) {
 		if (list_empty(buffer_queue))
 			return -EAGAIN;
@@ -897,8 +918,10 @@ static int virtio_media_dqbuf(struct file *file, void *fh,
 	} else if (!queue->streaming) {
 		return -EINVAL;
 	} else {
+		mutex_unlock(&vv->vlock);
 		ret = wait_event_interruptible(session->dqbufs_wait,
 					       !list_empty(buffer_queue));
+		mutex_lock(&vv->vlock);
 		if (ret)
 			return -EINTR;
 	}
@@ -1200,14 +1223,17 @@ const struct v4l2_ioctl_ops virtio_media_ioctl_ops = {
 long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 			       unsigned long arg)
 {
-	struct video_device *vfd = video_devdata(file);
+	struct video_device *video_dev = video_devdata(file);
+	struct virtio_media *vv = to_virtio_media(video_dev);
 	struct v4l2_fh *vfh = NULL;
 	struct v4l2_standard standard;
 	v4l2_std_id std_id = 0;
 	int ret;
 
-	if (test_bit(V4L2_FL_USES_V4L2_FH, &vfd->flags))
+	if (test_bit(V4L2_FL_USES_V4L2_FH, &video_dev->flags))
 		vfh = file->private_data;
+
+	mutex_lock(&vv->vlock);
 
 	/*
 	 * We need to handle a few ioctls manually because their result rely on
@@ -1219,33 +1245,41 @@ long virtio_media_device_ioctl(struct file *file, unsigned int cmd,
 	case VIDIOC_S_STD:
 		ret = copy_from_user(&std_id, (void __user *)arg,
 				     sizeof(std_id));
-		if (ret)
-			return -EINVAL;
-		return virtio_media_s_std(file, vfh, std_id);
-	case VIDIOC_ENUMSTD: {
+		if (ret) {
+			ret = -EINVAL;
+			break;
+		}
+		ret = virtio_media_s_std(file, vfh, std_id);
+		break;
+	case VIDIOC_ENUMSTD:
 		ret = copy_from_user(&standard, (void __user *)arg,
 				     sizeof(standard));
-		if (ret)
-			return -EINVAL;
+		if (ret) {
+			ret = -EINVAL;
+			break;
+		}
 		ret = virtio_media_enumstd(file, vfh, &standard);
 		if (ret)
-			return ret;
+			break;
 		ret = copy_to_user((void __user *)arg, &standard,
 				   sizeof(standard));
 		if (ret)
-			return -EINVAL;
-		return 0;
-	}
-	case VIDIOC_QUERYSTD: {
+			ret = -EINVAL;
+		break;
+	case VIDIOC_QUERYSTD:
 		ret = virtio_media_querystd(file, vfh, &std_id);
 		if (ret)
-			return ret;
+			break;
 		ret = copy_to_user((void __user *)arg, &std_id, sizeof(std_id));
 		if (ret)
-			return -EINVAL;
-		return 0;
-	}
+			ret = -EINVAL;
+		break;
 	default:
-		return video_ioctl2(file, cmd, arg);
+		ret = video_ioctl2(file, cmd, arg);
+		break;
 	}
+
+	mutex_unlock(&vv->vlock);
+
+	return ret;
 }

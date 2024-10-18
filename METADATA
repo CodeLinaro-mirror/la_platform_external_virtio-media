@@ -1,15 +1,20 @@
-name: "virtio-media"
-description:
-    "Rust device (MIT) and kernel device driver (GPLv2) for virtio-media"
+# This project was upgraded with external_updater.
+# Usage: tools/external_updater/updater.sh update external/virtio-media
+# For more info, check https://cs.android.com/android/platform/superproject/main/+/main:tools/external_updater/README.md
 
+name: "virtio-media"
+description: "Rust device (MIT) and kernel device driver (GPLv2) for virtio-media"
 third_party {
+  license_type: RESTRICTED
+  last_upgrade_date {
+    year: 2024
+    month: 10
+    day: 17
+  }
   identifier {
     type: "Git"
     value: "https://github.com/chromeos/virtio-media"
+    version: "v0.0.4"
     primary_source: true
-    version: "3ce51ccffcd0e7348f39184a6b483a105d4f2efe"
   }
-  version: "3ce51ccffcd0e7348f39184a6b483a105d4f2efe"
-  last_upgrade_date { year: 2024 month: 10 day: 8 }
-  license_type: RESTRICTED
 }

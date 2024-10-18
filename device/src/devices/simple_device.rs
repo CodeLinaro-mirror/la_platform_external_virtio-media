@@ -13,17 +13,19 @@ use std::io::Result as IoResult;
 use std::io::Seek;
 use std::io::SeekFrom;
 use std::io::Write;
+use std::os::fd::AsFd;
+use std::os::fd::BorrowedFd;
 
-use memfd::Memfd;
 use v4l2r::bindings;
 use v4l2r::bindings::v4l2_fmtdesc;
 use v4l2r::bindings::v4l2_format;
 use v4l2r::bindings::v4l2_pix_format;
 use v4l2r::bindings::v4l2_requestbuffers;
 use v4l2r::ioctl::BufferCapabilities;
+use v4l2r::ioctl::BufferField;
 use v4l2r::ioctl::BufferFlags;
-use v4l2r::ioctl::QueryBuf;
 use v4l2r::ioctl::V4l2Buffer;
+use v4l2r::ioctl::V4l2PlanesWithBackingMut;
 use v4l2r::memory::MemoryType;
 use v4l2r::PixelFormat;
 use v4l2r::QueueType;
@@ -31,18 +33,17 @@ use v4l2r::QueueType;
 use crate::ioctl::virtio_media_dispatch_ioctl;
 use crate::ioctl::IoctlResult;
 use crate::ioctl::VirtioMediaIoctlHandler;
+use crate::memfd::MemFdBuffer;
 use crate::mmap::MmapMappingManager;
 use crate::protocol::DequeueBufferEvent;
-use crate::protocol::MmapResp;
-use crate::protocol::MunmapResp;
 use crate::protocol::SgEntry;
 use crate::protocol::V4l2Event;
 use crate::protocol::V4l2Ioctl;
 use crate::protocol::VIRTIO_MEDIA_MMAP_FLAG_RW;
 use crate::VirtioMediaDevice;
+use crate::VirtioMediaDeviceSession;
 use crate::VirtioMediaEventQueue;
 use crate::VirtioMediaHostMemoryMapper;
-use crate::WriteDescriptorChain;
 
 /// Current status of a buffer.
 #[derive(Debug, PartialEq, Eq)]
@@ -62,72 +63,42 @@ enum BufferState {
 struct Buffer {
     /// Current state of the buffer.
     state: BufferState,
-    /// Queue of the buffer.
-    queue: QueueType,
-    /// Index of the buffer.
-    index: u32,
+    /// V4L2 representation of this buffer to be sent to the guest when requested.
+    v4l2_buffer: V4l2Buffer,
     /// Backing storage for the buffer.
-    fd: Memfd,
-    /// Size in bytes of the buffer.
-    size: u64,
+    fd: MemFdBuffer,
     /// Offset that can be used to map the buffer.
+    ///
+    /// Cached from `v4l2_buffer` to avoid doing a match.
     offset: u64,
-    /// `true` if the buffer is MMAP and is currently mapped into the guest memory space.
-    /// TODO find a good way to set this properly.
-    mapped: bool,
 }
 
 impl Buffer {
-    /// Generate a `V4l2Buffer` from the current information in this buffer. Useful as a reply to
-    /// the `QUERYBUF` and `QBUF` commands, and to `DQBUF` events.
-    fn to_v4l2_buffer(&self) -> V4l2Buffer {
-        // TODO add V4l2Buffer builder type.
-        let buffer = bindings::v4l2_buffer {
-            index: self.index,
-            type_: self.queue as u32,
-            // TODO if the buffer is dequeuable, fill this.
-            bytesused: if let BufferState::Outgoing { .. } = &self.state {
-                BUFFER_SIZE
-            } else {
-                0
-            },
-            flags: (match self.state {
-                BufferState::New => BufferFlags::empty(),
-                BufferState::Incoming => BufferFlags::QUEUED,
-                BufferState::Outgoing { .. } => BufferFlags::empty(),
-            } | if self.mapped {
-                BufferFlags::MAPPED
-            } else {
-                BufferFlags::empty()
-            } | BufferFlags::TIMESTAMP_MONOTONIC)
-                .bits(),
-            field: bindings::v4l2_field_V4L2_FIELD_NONE,
-            timestamp: if let BufferState::Outgoing { sequence } = &self.state {
-                bindings::timeval {
-                    tv_sec: (*sequence + 1) as i64 / 1000,
-                    tv_usec: (*sequence + 1) as i64 % 1000,
-                }
-            } else {
-                bindings::timeval {
-                    tv_sec: 0,
-                    tv_usec: 0,
-                }
-            },
-            timecode: Default::default(),
-            sequence: if let BufferState::Outgoing { sequence } = &self.state {
-                *sequence
-            } else {
-                0
-            },
-            memory: MemoryType::Mmap as u32,
-            m: bindings::v4l2_buffer__bindgen_ty_1 {
-                offset: self.offset as u32,
-            },
-            length: self.size as u32,
-            ..unsafe { std::mem::zeroed() }
-        };
+    /// Update the state of the buffer as well as its V4L2 representation.
+    fn set_state(&mut self, state: BufferState) {
+        let mut flags = self.v4l2_buffer.flags();
+        match state {
+            BufferState::New => {
+                *self.v4l2_buffer.get_first_plane_mut().bytesused = 0;
+                flags -= BufferFlags::QUEUED;
+            }
+            BufferState::Incoming => {
+                *self.v4l2_buffer.get_first_plane_mut().bytesused = 0;
+                flags |= BufferFlags::QUEUED;
+            }
+            BufferState::Outgoing { sequence } => {
+                *self.v4l2_buffer.get_first_plane_mut().bytesused = BUFFER_SIZE;
+                self.v4l2_buffer.set_sequence(sequence);
+                self.v4l2_buffer.set_timestamp(bindings::timeval {
+                    tv_sec: (sequence + 1) as bindings::__time_t / 1000,
+                    tv_usec: (sequence + 1) as bindings::__time_t % 1000,
+                });
+                flags -= BufferFlags::QUEUED;
+            }
+        }
 
-        V4l2Buffer::try_from_v4l2_buffer(buffer, None).unwrap()
+        self.v4l2_buffer.set_flags(flags);
+        self.state = state;
     }
 }
 
@@ -143,6 +114,12 @@ pub struct SimpleCaptureDeviceSession {
     queued_buffers: VecDeque<usize>,
     /// Is the session currently streaming?
     streaming: bool,
+}
+
+impl VirtioMediaDeviceSession for SimpleCaptureDeviceSession {
+    fn poll_fd(&self) -> Option<BorrowedFd> {
+        None
+    }
 }
 
 impl SimpleCaptureDeviceSession {
@@ -170,11 +147,14 @@ impl SimpleCaptureDeviceSession {
             for _ in 0..(WIDTH * HEIGHT) {
                 let _ = writer.write(&color).map_err(|_| libc::EIO)?;
             }
+            drop(writer);
 
-            buffer.state = BufferState::Outgoing { sequence };
+            *buffer.v4l2_buffer.get_first_plane_mut().bytesused = BUFFER_SIZE;
+            buffer.set_state(BufferState::Outgoing { sequence });
+            // TODO: should we set the DONE flag here?
             self.iteration += 1;
 
-            let v4l2_buffer = buffer.to_v4l2_buffer();
+            let v4l2_buffer = buffer.v4l2_buffer.clone();
 
             evt_queue.send_event(V4l2Event::DequeueBuffer(DequeueBufferEvent::new(
                 self.id,
@@ -244,7 +224,7 @@ where
         }
 
         for buffer in &session.buffers {
-            self.mmap_manager.unregister_buffer(buffer.offset)
+            self.mmap_manager.unregister_buffer(buffer.offset);
         }
     }
 
@@ -263,30 +243,32 @@ where
         session: &mut Self::Session,
         flags: u32,
         offset: u64,
-        writer: &mut Writer,
-    ) -> IoResult<()> {
-        let buffer = match session.buffers.iter_mut().find(|b| b.offset == offset) {
-            Some(buffer) => buffer,
-            None => return writer.write_err_response(libc::EINVAL),
-        };
+    ) -> Result<(u64, u64), i32> {
+        let buffer = session
+            .buffers
+            .iter_mut()
+            .find(|b| b.offset == offset)
+            .ok_or(libc::EINVAL)?;
         let rw = (flags & VIRTIO_MEDIA_MMAP_FLAG_RW) != 0;
-        let guest_addr =
-            match self
-                .mmap_manager
-                .create_mapping(offset, buffer.fd.as_file(), buffer.size, rw)
-            {
-                Ok(mapping) => mapping,
-                Err(_) => return writer.write_err_response(libc::EINVAL),
-            };
+        let fd = buffer.fd.as_file().as_fd();
+        let (guest_addr, size) = self
+            .mmap_manager
+            .create_mapping(offset, fd, rw)
+            .map_err(|_| libc::EINVAL)?;
 
-        writer.write_response(MmapResp::ok(guest_addr, buffer.size))
+        // TODO: would be nice to enable this, but how do we find the buffer again during munmap?
+        //
+        // Maybe keep a guest_addr -> session map in the device...
+        // buffer.v4l2_buffer.set_flags(buffer.v4l2_buffer.flags() | BufferFlags::MAPPED);
+
+        Ok((guest_addr, size))
     }
 
-    fn do_munmap(&mut self, guest_addr: u64, writer: &mut Writer) -> IoResult<()> {
-        match self.mmap_manager.remove_mapping(guest_addr) {
-            Ok(_) => writer.write_response(MunmapResp::ok()),
-            Err(_) => writer.write_err_response(libc::EINVAL),
-        }
+    fn do_munmap(&mut self, guest_addr: u64) -> Result<(), i32> {
+        self.mmap_manager
+            .remove_mapping(guest_addr)
+            .map(|_| ())
+            .map_err(|_| libc::EINVAL)
     }
 }
 
@@ -340,7 +322,7 @@ where
 
     fn enum_fmt(
         &mut self,
-        _session: &mut Self::Session,
+        _session: &Self::Session,
         queue: QueueType,
         index: u32,
     ) -> IoctlResult<v4l2_fmtdesc> {
@@ -354,11 +336,7 @@ where
         Ok(default_fmtdesc(queue))
     }
 
-    fn g_fmt(
-        &mut self,
-        _session: &mut Self::Session,
-        queue: QueueType,
-    ) -> IoctlResult<v4l2_format> {
+    fn g_fmt(&mut self, _session: &Self::Session, queue: QueueType) -> IoctlResult<v4l2_format> {
         if queue != QueueType::VideoCapture {
             return Err(libc::EINVAL);
         }
@@ -369,9 +347,9 @@ where
     fn s_fmt(
         &mut self,
         _session: &mut Self::Session,
-        format: v4l2_format,
+        queue: QueueType,
+        _format: v4l2_format,
     ) -> IoctlResult<v4l2_format> {
-        let queue = QueueType::n(format.type_).ok_or(libc::EINVAL)?;
         if queue != QueueType::VideoCapture {
             return Err(libc::EINVAL);
         }
@@ -381,11 +359,10 @@ where
 
     fn try_fmt(
         &mut self,
-        _session: &mut Self::Session,
-        format: v4l2_format,
+        _session: &Self::Session,
+        queue: QueueType,
+        _format: v4l2_format,
     ) -> IoctlResult<v4l2_format> {
-        // TODO pass the validated queue to these hooks?
-        let queue = QueueType::n(format.type_).ok_or(libc::EINVAL)?;
         if queue != QueueType::VideoCapture {
             return Err(libc::EINVAL);
         }
@@ -424,7 +401,7 @@ where
             // TODO factorize with streamoff.
             session.queued_buffers.clear();
             for buffer in session.buffers.iter_mut() {
-                buffer.state = BufferState::New;
+                buffer.set_state(BufferState::New);
             }
             self.active_session = Some(session.id);
         }
@@ -432,36 +409,48 @@ where
         let count = std::cmp::min(count, 32);
 
         for buffer in &session.buffers {
-            self.mmap_manager.unregister_buffer(buffer.offset)
+            self.mmap_manager.unregister_buffer(buffer.offset);
         }
 
         session.buffers = (0..count)
             .map(|i| {
-                memfd::MemfdOptions::default()
-                    .create(format!("simple device buffer {}", i))
-                    .map_err(|_| libc::ENOMEM)
+                MemFdBuffer::new(BUFFER_SIZE as u64)
+                    .map_err(|e| {
+                        log::error!("failed to allocate MMAP buffers: {:#}", e);
+                        libc::ENOMEM
+                    })
                     .and_then(|fd| {
-                        fd.as_file()
-                            .set_len(BUFFER_SIZE as u64)
-                            .map_err(|_| libc::ENOMEM)?;
+                        let offset = self
+                            .mmap_manager
+                            .register_buffer(None, BUFFER_SIZE as u64)
+                            .map_err(|_| libc::EINVAL)?;
+
+                        let mut v4l2_buffer =
+                            V4l2Buffer::new(QueueType::VideoCapture, i, MemoryType::Mmap);
+                        if let V4l2PlanesWithBackingMut::Mmap(mut planes) =
+                            v4l2_buffer.planes_with_backing_iter_mut()
+                        {
+                            // SAFETY: every buffer has at least one plane.
+                            let mut plane = planes.next().unwrap();
+                            plane.set_mem_offset(offset as u32);
+                            *plane.length = BUFFER_SIZE;
+                        } else {
+                            // SAFETY: we have just set the buffer type to MMAP. Reaching this point means a bug in
+                            // the code.
+                            panic!()
+                        }
+                        v4l2_buffer.set_field(BufferField::None);
+                        v4l2_buffer.set_flags(BufferFlags::TIMESTAMP_MONOTONIC);
 
                         Ok(Buffer {
                             state: BufferState::New,
-                            queue: QueueType::VideoCapture,
-                            index: i,
+                            v4l2_buffer,
                             fd,
-                            size: BUFFER_SIZE as u64,
-                            offset: i as u64 * BUFFER_SIZE as u64,
-                            mapped: false,
+                            offset,
                         })
                     })
             })
             .collect::<Result<_, _>>()?;
-
-        for buffer in &session.buffers {
-            self.mmap_manager
-                .register_buffer(buffer.offset, buffer.size)?;
-        }
 
         Ok(v4l2_requestbuffers {
             count,
@@ -476,7 +465,7 @@ where
 
     fn querybuf(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         queue: QueueType,
         index: u32,
     ) -> IoctlResult<v4l2r::ioctl::V4l2Buffer> {
@@ -485,7 +474,7 @@ where
         }
         let buffer = session.buffers.get(index as usize).ok_or(libc::EINVAL)?;
 
-        Ok(buffer.to_v4l2_buffer())
+        Ok(buffer.v4l2_buffer.clone())
     }
 
     fn qbuf(
@@ -499,14 +488,14 @@ where
             .get_mut(buffer.index() as usize)
             .ok_or(libc::EINVAL)?;
         // Attempt to queue already queued buffer.
-        if host_buffer.state == BufferState::Incoming {
+        if matches!(host_buffer.state, BufferState::Incoming) {
             return Err(libc::EINVAL);
         }
 
-        host_buffer.state = BufferState::Incoming;
+        host_buffer.set_state(BufferState::Incoming);
         session.queued_buffers.push_back(buffer.index() as usize);
 
-        let buffer = host_buffer.to_v4l2_buffer();
+        let buffer = host_buffer.v4l2_buffer.clone();
 
         if session.streaming {
             session.process_queued_buffers(&mut self.evt_queue)?;
@@ -533,13 +522,13 @@ where
         session.streaming = false;
         session.queued_buffers.clear();
         for buffer in session.buffers.iter_mut() {
-            buffer.state = BufferState::New;
+            buffer.set_state(BufferState::New);
         }
 
         Ok(())
     }
 
-    fn g_input(&mut self, _session: &mut Self::Session) -> IoctlResult<i32> {
+    fn g_input(&mut self, _session: &Self::Session) -> IoctlResult<i32> {
         Ok(0)
     }
 
@@ -553,7 +542,7 @@ where
 
     fn enuminput(
         &mut self,
-        _session: &mut Self::Session,
+        _session: &Self::Session,
         index: u32,
     ) -> IoctlResult<bindings::v4l2_input> {
         match INPUTS.get(index as usize) {

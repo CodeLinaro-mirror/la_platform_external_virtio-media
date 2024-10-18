@@ -5,12 +5,14 @@
 //! This module uses `v4l2r` to proxy a host V4L2 device into the guest.
 
 use std::collections::BTreeMap;
-use std::fs::File;
 use std::io::Result as IoResult;
+use std::os::fd::AsFd;
+use std::os::fd::BorrowedFd;
+use std::os::fd::OwnedFd;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::Duration;
 
-use anyhow::Context;
 use log::error;
 use log::warn;
 use v4l2r::bindings::v4l2_audio;
@@ -44,6 +46,9 @@ use v4l2r::bindings::v4l2_standard;
 use v4l2r::bindings::v4l2_std_id;
 use v4l2r::bindings::v4l2_streamparm;
 use v4l2r::bindings::v4l2_tuner;
+use v4l2r::device::poller::DeviceEvent;
+use v4l2r::device::poller::PollEvent;
+use v4l2r::device::poller::Poller;
 pub use v4l2r::device::Device as V4l2Device;
 use v4l2r::device::DeviceConfig;
 use v4l2r::device::DeviceOpenError;
@@ -52,12 +57,12 @@ use v4l2r::ioctl::BufferFlags;
 use v4l2r::ioctl::CtrlId;
 use v4l2r::ioctl::CtrlWhich;
 use v4l2r::ioctl::DqBufError;
+use v4l2r::ioctl::DqBufIoctlError;
 use v4l2r::ioctl::DqEventError;
 use v4l2r::ioctl::EventType as V4l2EventType;
 use v4l2r::ioctl::ExpbufFlags;
 use v4l2r::ioctl::ExtControlError;
 use v4l2r::ioctl::IntoErrno;
-use v4l2r::ioctl::QueryBuf;
 use v4l2r::ioctl::QueryCapError;
 use v4l2r::ioctl::QueryCtrlFlags;
 use v4l2r::ioctl::SelectionFlags;
@@ -68,7 +73,11 @@ use v4l2r::ioctl::TunerMode;
 use v4l2r::ioctl::TunerTransmissionFlags;
 use v4l2r::ioctl::TunerType;
 use v4l2r::ioctl::V4l2Buffer;
+use v4l2r::ioctl::V4l2PlanesWithBacking;
+use v4l2r::ioctl::V4l2PlanesWithBackingMut;
+use v4l2r::memory::Memory;
 use v4l2r::memory::MemoryType;
+use v4l2r::memory::UserPtr;
 use v4l2r::QueueType;
 
 use crate::ioctl::virtio_media_dispatch_ioctl;
@@ -76,72 +85,43 @@ use crate::ioctl::IoctlResult;
 use crate::ioctl::VirtioMediaIoctlHandler;
 use crate::mmap::MmapMappingManager;
 use crate::protocol::DequeueBufferEvent;
-use crate::protocol::MmapResp;
-use crate::protocol::MunmapResp;
 use crate::protocol::SessionEvent;
 use crate::protocol::SgEntry;
 use crate::protocol::V4l2Event;
 use crate::protocol::V4l2Ioctl;
 use crate::protocol::VIRTIO_MEDIA_MMAP_FLAG_RW;
+use crate::GuestMemoryRange;
 use crate::VirtioMediaDevice;
+use crate::VirtioMediaDeviceSession;
 use crate::VirtioMediaEventQueue;
 use crate::VirtioMediaGuestMemoryMapper;
 use crate::VirtioMediaHostMemoryMapper;
-use crate::WriteDescriptorChain;
+
+type GuestAddrType = <UserPtr as Memory>::RawBacking;
 
 fn guest_v4l2_buffer_to_host<M: VirtioMediaGuestMemoryMapper>(
-    v4l2_buffer: &V4l2Buffer,
-    mut guest_regions: Vec<Vec<SgEntry>>,
+    guest_buffer: &V4l2Buffer,
+    guest_regions: Vec<Vec<SgEntry>>,
     m: &M,
 ) -> anyhow::Result<(V4l2Buffer, Vec<M::GuestMemoryMapping>)> {
-    if v4l2_buffer.memory() == MemoryType::UserPtr && v4l2_buffer.v4l2_buffer().length > 0 {
-        let mut resources = vec![];
-        let mut host_buffer = *v4l2_buffer.v4l2_buffer();
-        let queue = v4l2_buffer.queue_type();
+    let mut resources = vec![];
+    // The host buffer is a copy of the guest's with its plane resources updated.
+    let mut host_buffer = guest_buffer.clone();
 
-        if queue.is_multiplanar() {
-            let mut host_planes = v4l2_buffer.v4l2_plane_iter().cloned().collect::<Vec<_>>();
+    if let V4l2PlanesWithBackingMut::UserPtr(host_planes) =
+        host_buffer.planes_with_backing_iter_mut()
+    {
+        for (mut host_plane, mem_regions) in
+            host_planes.filter(|p| *p.length > 0).zip(guest_regions)
+        {
+            let mapping = m.new_mapping(mem_regions)?;
 
-            for (plane, mem_regions) in host_planes
-                .iter_mut()
-                .filter(|p| p.length > 0)
-                .zip(guest_regions)
-            {
-                let mut mapping = m.new_mapping(mem_regions)?;
-
-                plane.m.userptr = mapping.as_mut().as_ptr() as u64;
-                resources.push(mapping);
-            }
-
-            let host_planes: [_; v4l2r::bindings::VIDEO_MAX_PLANES as usize] = host_planes
-                .into_iter()
-                .chain(std::iter::repeat(Default::default()))
-                .take(v4l2r::bindings::VIDEO_MAX_PLANES as usize)
-                .collect::<Vec<_>>()
-                .try_into()
-                .map_err(|_| {
-                    anyhow::anyhow!("could not convert vector of v4l2_planes into array")
-                })?;
-
-            Ok((
-                V4l2Buffer::try_from_v4l2_buffer(host_buffer, Some(host_planes))?,
-                resources,
-            ))
-        } else {
-            let mem_regions = guest_regions.remove(0);
-            let mut mapping = m.new_mapping(mem_regions)?;
-
-            host_buffer.m.userptr = mapping.as_mut().as_ptr() as u64;
+            host_plane.set_userptr(mapping.as_ptr() as GuestAddrType);
             resources.push(mapping);
-
-            Ok((
-                V4l2Buffer::try_from_v4l2_buffer(host_buffer, None)?,
-                resources,
-            ))
         }
-    } else {
-        Ok((v4l2_buffer.clone(), Default::default()))
-    }
+    };
+
+    Ok((host_buffer, resources))
 }
 
 /// Restore the user pointers of `host_buffer` using the values in `initial_guest_buffer`, if the buffer's
@@ -149,51 +129,27 @@ fn guest_v4l2_buffer_to_host<M: VirtioMediaGuestMemoryMapper>(
 /// guest with the correct values.
 fn host_v4l2_buffer_to_guest<R>(
     host_buffer: &V4l2Buffer,
-    userptr_buffers: &BTreeMap<u64, V4l2UserPlaneInfo<R>>,
+    userptr_buffers: &BTreeMap<GuestAddrType, V4l2UserPlaneInfo<R>>,
 ) -> anyhow::Result<V4l2Buffer> {
-    if host_buffer.memory() == MemoryType::UserPtr {
-        let mut guest_buffer = *host_buffer.v4l2_buffer();
-        let guest_planes = if host_buffer.queue_type().is_multiplanar() {
-            let mut guest_planes: [v4l2r::bindings::v4l2_plane;
-                v4l2r::bindings::VIDEO_MAX_PLANES as usize] = Default::default();
-            for (guest_plane, host_plane) in
-                guest_planes.iter_mut().zip(host_buffer.v4l2_plane_iter())
-            {
-                // Safe because we checked that the memory type is USERPTR.
-                let host_userptr = unsafe { host_plane.m.userptr };
-                *guest_plane = *host_plane;
-                if host_userptr != 0 {
-                    guest_plane.m.userptr = userptr_buffers
-                        .get(&host_userptr)
-                        .map(|p| p.guest_addr)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "host buffer address 0x{:x} not registered!",
-                                host_userptr
-                            )
-                        })?;
-                }
-            }
+    // The guest buffer is a copy of the host's with its plane resources updated.
+    let mut guest_buffer = host_buffer.clone();
 
-            Some(guest_planes)
-        } else {
-            // Safe because we checked that the memory type is USERPTR.
-            let host_userptr = unsafe { host_buffer.v4l2_buffer().m.userptr };
-            if host_userptr != 0 {
-                guest_buffer.m.userptr = userptr_buffers
-                    .get(&host_userptr)
-                    .map(|p| p.guest_addr)
-                    .ok_or_else(|| {
+    if let V4l2PlanesWithBackingMut::UserPtr(host_planes) =
+        guest_buffer.planes_with_backing_iter_mut()
+    {
+        for mut plane in host_planes.filter(|p| p.userptr() != 0) {
+            let host_userptr = plane.userptr();
+            let guest_userptr = userptr_buffers
+                .get(&(host_userptr as GuestAddrType))
+                .map(|p| p.guest_addr)
+                .ok_or_else(|| {
                     anyhow::anyhow!("host buffer address 0x{:x} not registered!", host_userptr)
                 })?;
-            }
-            None
-        };
-        V4l2Buffer::try_from_v4l2_buffer(guest_buffer, guest_planes)
-            .context("while patching guest memory addresses into host V4L2 buffer")
-    } else {
-        Ok(host_buffer.clone())
+            plane.set_userptr(guest_userptr as GuestAddrType);
+        }
     }
+
+    Ok(guest_buffer)
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -235,7 +191,7 @@ fn perform_ext_ctrls_ioctl<M: VirtioMediaGuestMemoryMapper>(
         .filter(|ctrl| ctrl.size > 0)
         .zip(payloads.iter_mut())
     {
-        ctrl.__bindgen_anon_1.ptr = payload.as_mut().as_mut_ptr() as *mut libc::c_void;
+        ctrl.__bindgen_anon_1.ptr = payload.as_mut_ptr() as *mut libc::c_void;
     }
 
     let res = match ioctl {
@@ -267,13 +223,17 @@ struct V4l2UserPlaneInfo<R> {
     /// Buffer index.
     index: u8,
 
-    guest_addr: u64,
+    guest_addr: GuestAddrType,
     _guest_resource: R,
 }
 
 pub struct V4l2Session<M: VirtioMediaGuestMemoryMapper> {
     id: u32,
     device: Arc<V4l2Device>,
+    /// Proxy epoll for polling `device`. We need to use a proxy here because V4L2 events are
+    /// signaled using `EPOLLPRI`, and we sometimes need to stop listening to the `CAPTURE` queue.
+    /// `poller`'s FD is what is actually added to the client's session poller.
+    poller: Poller,
 
     /// Type of the capture queue, if one has been set up.
     capture_queue_type: Option<QueueType>,
@@ -291,7 +251,13 @@ pub struct V4l2Session<M: VirtioMediaGuestMemoryMapper> {
     ///
     /// TODO this is not properly cleared. We should probably record the session ID and queue in
     /// order to remove the records upon REQBUFS or session deletion?
-    userptr_buffers: BTreeMap<u64, V4l2UserPlaneInfo<M::GuestMemoryMapping>>,
+    userptr_buffers: BTreeMap<GuestAddrType, V4l2UserPlaneInfo<M::GuestMemoryMapping>>,
+}
+
+impl<M: VirtioMediaGuestMemoryMapper> VirtioMediaDeviceSession for V4l2Session<M> {
+    fn poll_fd(&self) -> Option<BorrowedFd> {
+        Some(self.poller.as_fd())
+    }
 }
 
 impl<M> V4l2Session<M>
@@ -299,9 +265,14 @@ where
     M: VirtioMediaGuestMemoryMapper,
 {
     fn new(id: u32, device: Arc<V4l2Device>) -> Self {
+        // Only listen to V4L2 events for now.
+        let mut poller = Poller::new(Arc::clone(&device)).unwrap();
+        poller.enable_event(DeviceEvent::V4L2Event).unwrap();
+
         Self {
             id,
             device,
+            poller,
             capture_queue_type: None,
             output_queue_type: None,
             capture_streaming: false,
@@ -321,92 +292,31 @@ where
         &mut self,
         host_buffer: &V4l2Buffer,
         guest_buffer: &V4l2Buffer,
-        mut guest_resources: Vec<M::GuestMemoryMapping>,
+        guest_resources: Vec<M::GuestMemoryMapping>,
     ) {
-        let memory = host_buffer.memory();
-
-        if memory == MemoryType::UserPtr {
-            let queue = host_buffer.queue_type();
-
-            if queue.is_multiplanar() && host_buffer.v4l2_buffer().length > 0 {
-                // Safe because we have tested that the memory type is USERPTR.
-                unsafe {
-                    for ((host_plane, guest_plane), guest_resource) in host_buffer
-                        .v4l2_plane_iter()
-                        .zip(guest_buffer.v4l2_plane_iter())
-                        .filter(|(h, _)| h.m.userptr != 0)
-                        .zip(guest_resources.into_iter())
-                    {
-                        let plane_info = {
-                            V4l2UserPlaneInfo {
-                                queue: guest_buffer.queue_type(),
-                                index: guest_buffer.index() as u8,
-                                guest_addr: guest_plane.m.userptr,
-                                _guest_resource: guest_resource,
-                            }
-                        };
-                        self.userptr_buffers
-                            .insert(host_plane.m.userptr, plane_info);
-                    }
+        if let V4l2PlanesWithBacking::UserPtr(host_planes) = host_buffer.planes_with_backing_iter()
+        {
+            if let V4l2PlanesWithBacking::UserPtr(guest_planes) =
+                guest_buffer.planes_with_backing_iter()
+            {
+                for ((host_userptr, guest_plane), guest_resource) in host_planes
+                    .map(|p| p.userptr())
+                    .zip(guest_planes)
+                    .filter(|(h, _)| *h != 0)
+                    .zip(guest_resources.into_iter())
+                {
+                    let plane_info = {
+                        V4l2UserPlaneInfo {
+                            queue: guest_buffer.queue(),
+                            index: guest_buffer.index() as u8,
+                            guest_addr: guest_plane.userptr(),
+                            _guest_resource: guest_resource,
+                        }
+                    };
+                    self.userptr_buffers.insert(host_userptr, plane_info);
                 }
-            } else if !queue.is_multiplanar() && host_buffer.v4l2_buffer().length > 0 {
-                let host_addr = unsafe { host_buffer.v4l2_buffer().m.userptr };
-                let guest_addr = unsafe { guest_buffer.v4l2_buffer().m.userptr };
-                let plane_info = V4l2UserPlaneInfo {
-                    queue: guest_buffer.queue_type(),
-                    index: guest_buffer.index() as u8,
-                    guest_addr,
-                    _guest_resource: guest_resources.remove(0),
-                };
-
-                self.userptr_buffers.insert(host_addr, plane_info);
             }
         }
-    }
-}
-
-/// Trait allowing a session to be polled for events and capture buffers.
-///
-/// The worker that runs a `V4l2ProxyDevice` typically polls on file descriptors for available
-/// CAPTURE buffers and outstanding session events. However V4L2's poll logic returns with the
-/// `POLLERR` flag if a CAPTURE queue is polled while not streaming or if zero CAPTURE buffers have
-/// been queued. To avoid this, the device needs to disable polling when this would happen, and
-/// re-enable it when conditions are adequate.
-///
-/// If the worker does not need such a feature, `()` can be passed as a no-op type that implements
-/// this interface.
-pub trait SessionPoller {
-    /// Add a newly created `session` to be polled for events (not capture buffers).
-    fn add_session(&self, session: &V4l2Device, session_id: u32) -> Result<(), i32>;
-    /// Stop polling all activity on `session`.
-    fn remove_session(&self, session: &V4l2Device);
-
-    /// Start or stop polling for available CAPTURE buffers on `session`, on which `add_session`
-    /// has been previously invoked. Events are always polled regardless of the value of `poll`.
-    fn poll_capture_buffers(
-        &self,
-        session: &V4l2Device,
-        session_id: u32,
-        poll: bool,
-    ) -> Result<(), i32>;
-}
-
-/// No-op implementation of `SessionPoller`. This is here for convenience but should probably not
-/// be used.
-impl SessionPoller for () {
-    fn add_session(&self, _session: &V4l2Device, _session_id: u32) -> Result<(), i32> {
-        Ok(())
-    }
-
-    fn remove_session(&self, _session: &V4l2Device) {}
-
-    fn poll_capture_buffers(
-        &self,
-        _session: &V4l2Device,
-        _session_id: u32,
-        _poll: bool,
-    ) -> Result<(), i32> {
-        Ok(())
     }
 }
 
@@ -423,10 +333,6 @@ struct V4l2MmapPlaneInfo {
     index: u8,
     /// Plane index.
     plane: u8,
-    /// Length of the plane in bytes.
-    length: u32,
-    /// Exported file descriptor, if a map into the guest has been requested.
-    exported_fd: Option<File>,
     /// Guest address at which the buffer has been mapped.
     map_address: u64,
     /// Whether the buffer is still active from the device's point of view.
@@ -438,14 +344,12 @@ pub struct V4l2ProxyDevice<
     Q: VirtioMediaEventQueue,
     M: VirtioMediaGuestMemoryMapper,
     HM: VirtioMediaHostMemoryMapper,
-    P: SessionPoller = (),
 > {
     /// `/dev/videoX` host device path.
     device_path: PathBuf,
 
     mem: M,
     evt_queue: Q,
-    session_poller: P,
 
     /// Map of memory offsets to detailed buffer information. Only used for queues which memory
     /// type is MMAP.
@@ -454,21 +358,21 @@ pub struct V4l2ProxyDevice<
     mmap_manager: MmapMappingManager<HM>,
 }
 
-pub struct DequeueEventError(i32);
-pub struct DequeueBufferError(i32);
+#[derive(Debug)]
+pub struct DequeueEventError(pub i32);
+#[derive(Debug)]
+pub struct DequeueBufferError(pub i32);
 
-impl<Q, M, HM, P> V4l2ProxyDevice<Q, M, HM, P>
+impl<Q, M, HM> V4l2ProxyDevice<Q, M, HM>
 where
     Q: VirtioMediaEventQueue,
     M: VirtioMediaGuestMemoryMapper,
     HM: VirtioMediaHostMemoryMapper,
-    P: SessionPoller,
 {
-    pub fn new(device_path: PathBuf, evt_queue: Q, mem: M, mapper: HM, session_poller: P) -> Self {
+    pub fn new(device_path: PathBuf, evt_queue: Q, mem: M, mapper: HM) -> Self {
         Self {
             mem,
             evt_queue,
-            session_poller,
             device_path,
             mmap_buffers: Default::default(),
             mmap_manager: MmapMappingManager::from(mapper),
@@ -485,8 +389,6 @@ where
         }
         // Garbage-collect buffers that can be deleted.
         self.mmap_buffers.retain(|_, b| b.active);
-
-        self.session_poller.remove_session(&session.device);
     }
 
     /// Clear all the previous buffer information for this queue, and insert new information if the
@@ -495,7 +397,6 @@ where
         &mut self,
         session: &mut V4l2Session<M>,
         queue: QueueType,
-        memory: MemoryType,
         range: std::ops::Range<u32>,
     ) {
         // Remove buffers that have been deallocated.
@@ -510,32 +411,22 @@ where
         // Garbage-collect buffers that can be deleted.
         self.mmap_buffers.retain(|_, b| b.active);
 
-        if memory == MemoryType::Mmap {
-            for i in range {
-                let buffer = match v4l2r::ioctl::querybuf::<V4l2Buffer>(
-                    &session.device,
-                    queue,
-                    i as usize,
-                ) {
+        for i in range {
+            let buffer =
+                match v4l2r::ioctl::querybuf::<V4l2Buffer>(&session.device, queue, i as usize) {
                     Ok(buffer) => buffer,
                     Err(e) => {
                         warn!("failed to query newly allocated buffer: {:#}", e);
                         continue;
                     }
                 };
-                // TODO(v4l2r) have an iterator instead?
-                for j in 0..buffer.num_planes() {
-                    let plane = buffer.get_plane(j).unwrap();
-                    let offset = match plane.mem_offset() {
-                        Some(offset) => offset,
-                        None => {
-                            warn!("expected a plane memory offset but none present");
-                            continue;
-                        }
-                    };
+
+            if let V4l2PlanesWithBacking::Mmap(planes) = buffer.planes_with_backing_iter() {
+                for (j, plane) in planes.enumerate() {
+                    let offset = plane.mem_offset();
 
                     self.mmap_manager
-                        .register_buffer(offset as u64, plane.length() as u64)
+                        .register_buffer(Some(offset as u64), *plane.length as u64)
                         .unwrap();
 
                     self.mmap_buffers.insert(
@@ -545,14 +436,12 @@ where
                             queue,
                             index: buffer.index() as u8,
                             plane: j as u8,
-                            length: plane.length(),
                             map_address: 0,
-                            exported_fd: None,
                             active: true,
                         },
                     );
                 }
-            }
+            };
         }
 
         // If we allocated on the capture or output queue successfully, remember its type.
@@ -571,10 +460,7 @@ where
     /// Dequeue all pending events for `session` and send them to the guest.
     ///
     /// In case of error, the session should be considered invalid and destroyed.
-    pub fn dequeue_events(
-        &mut self,
-        session: &mut V4l2Session<M>,
-    ) -> Result<(), DequeueEventError> {
+    fn dequeue_events(&mut self, session: &mut V4l2Session<M>) -> Result<(), DequeueEventError> {
         loop {
             match v4l2r::ioctl::dqevent::<v4l2_event>(&session.device) {
                 Ok(event) => self
@@ -594,7 +480,7 @@ where
     /// `evt_queue`.
     ///
     /// In case of error, the session should be considered invalid and destroyed.
-    pub fn dequeue_output_buffers(
+    fn dequeue_output_buffers(
         &mut self,
         session: &mut V4l2Session<M>,
     ) -> Result<(), DequeueBufferError> {
@@ -620,7 +506,8 @@ where
                             session.id, buffer,
                         )))
                 }
-                Err(DqBufError::Eos) | Err(DqBufError::NotReady) => return Ok(()),
+                Err(DqBufError::IoctlError(DqBufIoctlError::Eos))
+                | Err(DqBufError::IoctlError(DqBufIoctlError::NotReady)) => return Ok(()),
                 Err(e) => {
                     let err = e.into_errno();
                     self.evt_queue.send_error(session.id, err);
@@ -633,10 +520,9 @@ where
     /// Attempt to dequeue a single CAPTURE buffer and send the corresponding event to `evt_queue`.
     ///
     /// In case of error, the session should be considered invalid and destroyed.
-    pub fn dequeue_capture_buffer(
+    fn dequeue_capture_buffer(
         &mut self,
         session: &mut V4l2Session<M>,
-        wait_ctx: &P,
     ) -> Result<(), DequeueBufferError> {
         let capture_queue_type = match session.capture_queue_type {
             Some(queue_type) => queue_type,
@@ -646,8 +532,8 @@ where
         let v4l2_buffer =
             match v4l2r::ioctl::dqbuf::<V4l2Buffer>(&session.device, capture_queue_type) {
                 Ok(buffer) => buffer,
-                Err(DqBufError::Eos) => return Ok(()),
-                Err(DqBufError::NotReady) => return Ok(()),
+                Err(DqBufError::IoctlError(DqBufIoctlError::Eos)) => return Ok(()),
+                Err(DqBufError::IoctlError(DqBufIoctlError::NotReady)) => return Ok(()),
                 Err(e) => {
                     let err = e.into_errno();
                     self.evt_queue.send_error(session.id, err);
@@ -666,7 +552,7 @@ where
             // This may or may not be needed...
             v4l2_buffer.flags().contains(BufferFlags::LAST)
         {
-            if let Err(e) = wait_ctx.poll_capture_buffers(&session.device, session.id, false) {
+            if let Err(e) = session.poller.disable_event(DeviceEvent::CaptureReady) {
                 error!("cannot disable CAPTURE polling after last buffer: {}", e);
             }
         }
@@ -681,31 +567,31 @@ where
     }
 }
 
-impl<Q, M, HM, P> VirtioMediaIoctlHandler for V4l2ProxyDevice<Q, M, HM, P>
+impl<Q, M, HM> VirtioMediaIoctlHandler for V4l2ProxyDevice<Q, M, HM>
 where
     Q: VirtioMediaEventQueue,
     M: VirtioMediaGuestMemoryMapper,
     HM: VirtioMediaHostMemoryMapper,
-    P: SessionPoller,
 {
     type Session = V4l2Session<M>;
 
     fn enum_fmt(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         queue: QueueType,
         index: u32,
     ) -> IoctlResult<v4l2_fmtdesc> {
         v4l2r::ioctl::enum_fmt(&session.device, queue, index).map_err(IntoErrno::into_errno)
     }
 
-    fn g_fmt(&mut self, session: &mut Self::Session, queue: QueueType) -> IoctlResult<v4l2_format> {
+    fn g_fmt(&mut self, session: &Self::Session, queue: QueueType) -> IoctlResult<v4l2_format> {
         v4l2r::ioctl::g_fmt(&session.device, queue).map_err(IntoErrno::into_errno)
     }
 
     fn s_fmt(
         &mut self,
         session: &mut Self::Session,
+        _queue: QueueType,
         format: v4l2_format,
     ) -> IoctlResult<v4l2_format> {
         v4l2r::ioctl::s_fmt(&mut session.device, format).map_err(IntoErrno::into_errno)
@@ -725,7 +611,7 @@ where
         // We do not support requests at the moment, so do not advertize them.
         reqbufs.capabilities &= !v4l2r::bindings::V4L2_BUF_CAP_SUPPORTS_REQUESTS;
 
-        self.update_mmap_offsets(session, queue, memory, 0..reqbufs.count);
+        self.update_mmap_offsets(session, queue, 0..reqbufs.count);
 
         match queue {
             QueueType::VideoCapture | QueueType::VideoCaptureMplane => {
@@ -735,11 +621,7 @@ where
                     session.capture_streaming = false;
                     session.capture_num_queued = 0;
                     if was_polling_capture {
-                        if let Err(e) = self.session_poller.poll_capture_buffers(
-                            &session.device,
-                            session.id,
-                            false,
-                        ) {
+                        if let Err(e) = session.poller.disable_event(DeviceEvent::CaptureReady) {
                             error!(
                                 "cannot disable CAPTURE polling after REQBUFS(0) ioctl: {}",
                                 e
@@ -763,7 +645,7 @@ where
 
     fn querybuf(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         queue: QueueType,
         index: u32,
     ) -> IoctlResult<V4l2Buffer> {
@@ -786,10 +668,7 @@ where
             {
                 session.capture_streaming = true;
                 if session.should_poll_capture() {
-                    if let Err(e) =
-                        self.session_poller
-                            .poll_capture_buffers(&session.device, session.id, true)
-                    {
+                    if let Err(e) = session.poller.enable_event(DeviceEvent::CaptureReady) {
                         error!("cannot enable CAPTURE polling after STREAMON ioctl: {}", e);
                     }
                 }
@@ -812,10 +691,7 @@ where
                 session.capture_streaming = false;
                 session.capture_num_queued = 0;
                 if was_polling_capture {
-                    if let Err(e) =
-                        self.session_poller
-                            .poll_capture_buffers(&session.device, session.id, false)
-                    {
+                    if let Err(e) = session.poller.disable_event(DeviceEvent::CaptureReady) {
                         error!(
                             "cannot disable CAPTURE polling after STREAMOFF ioctl: {}",
                             e
@@ -847,9 +723,8 @@ where
             guest_v4l2_buffer_to_host(&guest_buffer, guest_regions, &self.mem)
                 .map_err(|_| libc::EINVAL)?;
         session.register_userptr_addresses(&host_buffer, &guest_buffer, guest_resources);
-        let queue = host_buffer.queue_type();
-        let index = host_buffer.index() as usize;
-        let out_buffer = v4l2r::ioctl::qbuf(&session.device, queue, index, host_buffer)
+        let queue = host_buffer.queue();
+        let out_buffer = v4l2r::ioctl::qbuf(&session.device, host_buffer)
             .map_err(|e| e.into_errno())
             .and_then(|host_out_buffer| {
                 // TODO if we had a PREPARE_BUF before, do we need to patch the addresses
@@ -865,10 +740,7 @@ where
                 let was_polling_capture = session.should_poll_capture();
                 session.capture_num_queued += 1;
                 if !was_polling_capture && session.should_poll_capture() {
-                    if let Err(e) =
-                        self.session_poller
-                            .poll_capture_buffers(&session.device, session.id, true)
-                    {
+                    if let Err(e) = session.poller.enable_event(DeviceEvent::CaptureReady) {
                         error!("cannot enable CAPTURE polling after QBUF ioctl: {}", e);
                     }
                 }
@@ -884,7 +756,7 @@ where
 
     fn g_parm(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         queue: QueueType,
     ) -> IoctlResult<v4l2_streamparm> {
         v4l2r::ioctl::g_parm(&session.device, queue).map_err(|e| e.into_errno())
@@ -898,7 +770,7 @@ where
         v4l2r::ioctl::s_parm(&session.device, parm).map_err(|e| e.into_errno())
     }
 
-    fn g_std(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_std_id> {
+    fn g_std(&mut self, session: &Self::Session) -> IoctlResult<v4l2_std_id> {
         v4l2r::ioctl::g_std(&session.device).map_err(|e| e.into_errno())
     }
 
@@ -906,15 +778,15 @@ where
         v4l2r::ioctl::s_std(&session.device, std).map_err(|e| e.into_errno())
     }
 
-    fn enumstd(&mut self, session: &mut Self::Session, index: u32) -> IoctlResult<v4l2_standard> {
+    fn enumstd(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_standard> {
         v4l2r::ioctl::enumstd(&session.device, index).map_err(|e| e.into_errno())
     }
 
-    fn enuminput(&mut self, session: &mut Self::Session, index: u32) -> IoctlResult<v4l2_input> {
+    fn enuminput(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_input> {
         v4l2r::ioctl::enuminput(&session.device, index as usize).map_err(|e| e.into_errno())
     }
 
-    fn g_ctrl(&mut self, session: &mut Self::Session, id: u32) -> IoctlResult<v4l2_control> {
+    fn g_ctrl(&mut self, session: &Self::Session, id: u32) -> IoctlResult<v4l2_control> {
         v4l2r::ioctl::g_ctrl(&session.device, id)
             .map(|value| v4l2_control { id, value })
             .map_err(|e| e.into_errno())
@@ -931,7 +803,7 @@ where
             .map_err(|e| e.into_errno())
     }
 
-    fn g_tuner(&mut self, session: &mut Self::Session, index: u32) -> IoctlResult<v4l2_tuner> {
+    fn g_tuner(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_tuner> {
         v4l2r::ioctl::g_tuner(&session.device, index).map_err(|e| e.into_errno())
     }
 
@@ -944,7 +816,7 @@ where
         v4l2r::ioctl::s_tuner(&session.device, index, mode).map_err(|e| e.into_errno())
     }
 
-    fn g_audio(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_audio> {
+    fn g_audio(&mut self, session: &Self::Session) -> IoctlResult<v4l2_audio> {
         v4l2r::ioctl::g_audio(&session.device).map_err(|e| e.into_errno())
     }
 
@@ -959,7 +831,7 @@ where
 
     fn queryctrl(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         id: v4l2r::ioctl::CtrlId,
         flags: v4l2r::ioctl::QueryCtrlFlags,
     ) -> IoctlResult<v4l2_queryctrl> {
@@ -968,14 +840,14 @@ where
 
     fn querymenu(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         id: u32,
         index: u32,
     ) -> IoctlResult<v4l2_querymenu> {
         v4l2r::ioctl::querymenu(&session.device, id, index).map_err(|e| e.into_errno())
     }
 
-    fn g_input(&mut self, session: &mut Self::Session) -> IoctlResult<i32> {
+    fn g_input(&mut self, session: &Self::Session) -> IoctlResult<i32> {
         v4l2r::ioctl::g_input(&session.device)
             .map(|i| i as i32)
             .map_err(|e| e.into_errno())
@@ -987,7 +859,7 @@ where
             .map_err(|e| e.into_errno())
     }
 
-    fn g_output(&mut self, session: &mut Self::Session) -> IoctlResult<i32> {
+    fn g_output(&mut self, session: &Self::Session) -> IoctlResult<i32> {
         v4l2r::ioctl::g_output(&session.device)
             .map(|o| o as i32)
             .map_err(|e| e.into_errno())
@@ -999,11 +871,11 @@ where
             .map_err(|e| e.into_errno())
     }
 
-    fn enumoutput(&mut self, session: &mut Self::Session, index: u32) -> IoctlResult<v4l2_output> {
+    fn enumoutput(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_output> {
         v4l2r::ioctl::enumoutput(&session.device, index as usize).map_err(|e| e.into_errno())
     }
 
-    fn g_audout(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_audioout> {
+    fn g_audout(&mut self, session: &Self::Session) -> IoctlResult<v4l2_audioout> {
         v4l2r::ioctl::g_audout(&session.device).map_err(|e| e.into_errno())
     }
 
@@ -1011,11 +883,7 @@ where
         v4l2r::ioctl::s_audout(&session.device, index).map_err(|e| e.into_errno())
     }
 
-    fn g_modulator(
-        &mut self,
-        session: &mut Self::Session,
-        index: u32,
-    ) -> IoctlResult<v4l2_modulator> {
+    fn g_modulator(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_modulator> {
         v4l2r::ioctl::g_modulator(&session.device, index).map_err(|e| e.into_errno())
     }
 
@@ -1028,11 +896,7 @@ where
         v4l2r::ioctl::s_modulator(&session.device, index, flags).map_err(|e| e.into_errno())
     }
 
-    fn g_frequency(
-        &mut self,
-        session: &mut Self::Session,
-        tuner: u32,
-    ) -> IoctlResult<v4l2_frequency> {
+    fn g_frequency(&mut self, session: &Self::Session, tuner: u32) -> IoctlResult<v4l2_frequency> {
         v4l2r::ioctl::g_frequency(&session.device, tuner).map_err(|e| e.into_errno())
     }
 
@@ -1047,34 +911,31 @@ where
             .map_err(|e| e.into_errno())
     }
 
-    fn querystd(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_std_id> {
+    fn querystd(&mut self, session: &Self::Session) -> IoctlResult<v4l2_std_id> {
         v4l2r::ioctl::querystd::<v4l2_std_id>(&session.device).map_err(|e| e.into_errno())
     }
 
     fn try_fmt(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
+        _queue: QueueType,
         format: v4l2_format,
     ) -> IoctlResult<v4l2_format> {
         v4l2r::ioctl::try_fmt::<_, v4l2_format>(&session.device, format).map_err(|e| e.into_errno())
     }
 
-    fn enumaudio(&mut self, session: &mut Self::Session, index: u32) -> IoctlResult<v4l2_audio> {
+    fn enumaudio(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_audio> {
         v4l2r::ioctl::enumaudio::<v4l2_audio>(&session.device, index).map_err(|e| e.into_errno())
     }
 
-    fn enumaudout(
-        &mut self,
-        session: &mut Self::Session,
-        index: u32,
-    ) -> IoctlResult<v4l2_audioout> {
+    fn enumaudout(&mut self, session: &Self::Session, index: u32) -> IoctlResult<v4l2_audioout> {
         v4l2r::ioctl::enumaudout::<v4l2_audioout>(&session.device, index)
             .map_err(|e| e.into_errno())
     }
 
     fn g_ext_ctrls(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         which: CtrlWhich,
         ctrls: &mut v4l2_ext_controls,
         ctrl_array: &mut Vec<v4l2_ext_control>,
@@ -1110,7 +971,7 @@ where
 
     fn try_ext_ctrls(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         which: CtrlWhich,
         ctrls: &mut v4l2_ext_controls,
         ctrl_array: &mut Vec<v4l2_ext_control>,
@@ -1128,7 +989,7 @@ where
 
     fn enum_framesizes(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         index: u32,
         pixel_format: u32,
     ) -> IoctlResult<v4l2_frmsizeenum> {
@@ -1138,7 +999,7 @@ where
 
     fn enum_frameintervals(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         index: u32,
         pixel_format: u32,
         width: u32,
@@ -1154,7 +1015,7 @@ where
         .map_err(|e| e.into_errno())
     }
 
-    fn g_enc_index(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_enc_idx> {
+    fn g_enc_index(&mut self, session: &Self::Session) -> IoctlResult<v4l2_enc_idx> {
         v4l2r::ioctl::g_enc_index(&session.device).map_err(|e| e.into_errno())
     }
 
@@ -1168,7 +1029,7 @@ where
 
     fn try_encoder_cmd(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         cmd: v4l2_encoder_cmd,
     ) -> IoctlResult<v4l2_encoder_cmd> {
         v4l2r::ioctl::try_encoder_cmd(&session.device, cmd).map_err(|e| e.into_errno())
@@ -1182,7 +1043,7 @@ where
         v4l2r::ioctl::s_dv_timings(&session.device, timings).map_err(|e| e.into_errno())
     }
 
-    fn g_dv_timings(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_dv_timings> {
+    fn g_dv_timings(&mut self, session: &Self::Session) -> IoctlResult<v4l2_dv_timings> {
         v4l2r::ioctl::g_dv_timings(&session.device).map_err(|e| e.into_errno())
     }
 
@@ -1236,7 +1097,7 @@ where
         .map_err(|e| (e.into_errno()))?;
 
         let bufs_range = create_bufs.index..(create_bufs.index + create_bufs.count);
-        self.update_mmap_offsets(session, queue, memory, bufs_range);
+        self.update_mmap_offsets(session, queue, bufs_range);
 
         Ok(create_bufs)
     }
@@ -1251,9 +1112,7 @@ where
             guest_v4l2_buffer_to_host(&guest_buffer, guest_regions, &self.mem)
                 .map_err(|_| libc::EINVAL)?;
         session.register_userptr_addresses(&host_buffer, &guest_buffer, guest_resources);
-        let queue = host_buffer.queue_type();
-        let index = host_buffer.index() as usize;
-        v4l2r::ioctl::prepare_buf(&session.device, queue, index, host_buffer)
+        v4l2r::ioctl::prepare_buf(&session.device, host_buffer)
             .map_err(|e| e.into_errno())
             .and_then(|host_out_buffer| {
                 host_v4l2_buffer_to_guest(&host_out_buffer, &session.userptr_buffers).map_err(|e| {
@@ -1265,7 +1124,7 @@ where
 
     fn g_selection(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         sel_type: SelectionType,
         sel_target: SelectionTarget,
     ) -> IoctlResult<v4l2_rect> {
@@ -1294,7 +1153,7 @@ where
 
     fn try_decoder_cmd(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         cmd: v4l2_decoder_cmd,
     ) -> IoctlResult<v4l2_decoder_cmd> {
         v4l2r::ioctl::try_decoder_cmd(&session.device, cmd).map_err(|e| e.into_errno())
@@ -1302,23 +1161,23 @@ where
 
     fn enum_dv_timings(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         index: u32,
     ) -> IoctlResult<v4l2_dv_timings> {
         v4l2r::ioctl::enum_dv_timings(&session.device, index).map_err(|e| e.into_errno())
     }
 
-    fn query_dv_timings(&mut self, session: &mut Self::Session) -> IoctlResult<v4l2_dv_timings> {
+    fn query_dv_timings(&mut self, session: &Self::Session) -> IoctlResult<v4l2_dv_timings> {
         v4l2r::ioctl::query_dv_timings(&session.device).map_err(|e| e.into_errno())
     }
 
-    fn dv_timings_cap(&self, session: &mut Self::Session) -> IoctlResult<v4l2_dv_timings_cap> {
+    fn dv_timings_cap(&self, session: &Self::Session) -> IoctlResult<v4l2_dv_timings_cap> {
         v4l2r::ioctl::dv_timings_cap(&session.device).map_err(|e| e.into_errno())
     }
 
     fn enum_freq_bands(
         &self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         tuner: u32,
         type_: TunerType,
         index: u32,
@@ -1329,7 +1188,7 @@ where
 
     fn query_ext_ctrl(
         &mut self,
-        session: &mut Self::Session,
+        session: &Self::Session,
         id: CtrlId,
         flags: QueryCtrlFlags,
     ) -> IoctlResult<v4l2_query_ext_ctrl> {
@@ -1338,12 +1197,11 @@ where
     }
 }
 
-impl<Q, M, HM, P, Reader, Writer> VirtioMediaDevice<Reader, Writer> for V4l2ProxyDevice<Q, M, HM, P>
+impl<Q, M, HM, Reader, Writer> VirtioMediaDevice<Reader, Writer> for V4l2ProxyDevice<Q, M, HM>
 where
     Q: VirtioMediaEventQueue,
     M: VirtioMediaGuestMemoryMapper,
     HM: VirtioMediaHostMemoryMapper,
-    P: SessionPoller,
     Reader: std::io::Read,
     Writer: std::io::Write,
 {
@@ -1351,16 +1209,7 @@ where
 
     fn new_session(&mut self, session_id: u32) -> Result<Self::Session, i32> {
         match V4l2Device::open(&self.device_path, DeviceConfig::new().non_blocking_dqbuf()) {
-            Ok(device) => {
-                let session = V4l2Session::new(session_id, Arc::new(device));
-                match self.session_poller.add_session(&session.device, session.id) {
-                    Ok(()) => Ok(session),
-                    Err(e) => {
-                        error!("failed to add FD of new V4L2 session for polling: {}", e);
-                        Err(e)
-                    }
-                }
-            }
+            Ok(device) => Ok(V4l2Session::new(session_id, Arc::new(device))),
             Err(DeviceOpenError::OpenError(e)) => Err(e as i32),
             Err(DeviceOpenError::QueryCapError(QueryCapError::IoctlError(e))) => Err(e as i32),
         }
@@ -1375,73 +1224,45 @@ where
         session: &mut Self::Session,
         flags: u32,
         offset: u64,
-        writer: &mut Writer,
-    ) -> IoResult<()> {
+    ) -> Result<(u64, u64), i32> {
         let rw = (flags & VIRTIO_MEDIA_MMAP_FLAG_RW) != 0;
 
-        let plane_info = match self.mmap_buffers.get_mut(&offset) {
-            Some(plane_info) => plane_info,
-            None => return writer.write_err_response(libc::EINVAL),
-        };
+        let plane_info = self.mmap_buffers.get_mut(&offset).ok_or(libc::EINVAL)?;
 
         // Export the FD for the plane and cache it if needed.
-        let exported_fd = match &mut plane_info.exported_fd {
-            Some(fd) => fd,
-            None => {
-                let fd = match v4l2r::ioctl::expbuf::<File>(
-                    &session.device,
-                    plane_info.queue,
-                    plane_info.index as usize,
-                    plane_info.plane as usize,
-                    if rw {
-                        ExpbufFlags::RDWR
-                    } else {
-                        ExpbufFlags::RDONLY
-                    },
-                ) {
-                    Ok(desc) => desc,
-                    Err(e) => return writer.write_err_response(e.into_errno()),
-                };
+        //
+        // We must NOT cache this result to reuse in case of multiple MMAP requests. If we do, then
+        // there is the risk that a session requests a buffer belonging to another one. The call
+        // the `expbuf` also serves as a permission check that the requesting session indeed has
+        // access to the buffer.
+        let exported_fd = v4l2r::ioctl::expbuf::<OwnedFd>(
+            &session.device,
+            plane_info.queue,
+            plane_info.index as usize,
+            plane_info.plane as usize,
+            if rw {
+                ExpbufFlags::RDWR
+            } else {
+                ExpbufFlags::RDONLY
+            },
+        )
+        .map_err(|e| e.into_errno())?;
 
-                plane_info.exported_fd.get_or_insert(fd)
-            }
-        };
+        let (mapping_addr, mapping_size) = self
+            .mmap_manager
+            .create_mapping(offset, exported_fd.as_fd(), rw)
+            // TODO: better error mapping?
+            .map_err(|_| libc::EINVAL)?;
 
-        plane_info.map_address = match self.mmap_manager.create_mapping(
-            offset,
-            exported_fd,
-            plane_info.length as u64,
-            rw,
-        ) {
-            Ok(guest_addr) => guest_addr,
-            Err(e) => return writer.write_err_response(e),
-        };
-
-        writer.write_response(MmapResp::ok(
-            plane_info.map_address,
-            plane_info.length as u64,
-        ))
+        plane_info.map_address = mapping_addr;
+        Ok((mapping_addr, mapping_size))
     }
 
-    fn do_munmap(&mut self, guest_addr: u64, writer: &mut Writer) -> IoResult<()> {
-        match self.mmap_manager.remove_mapping(guest_addr) {
-            Ok(has_mappings) => {
-                // Free the exported handle if this was the last mapping.
-                if !has_mappings {
-                    if let Some(entry) = self
-                        .mmap_buffers
-                        .iter_mut()
-                        .map(|(_, entry)| entry)
-                        .find(|entry| entry.map_address == guest_addr)
-                    {
-                        entry.exported_fd = None
-                    };
-                }
-
-                writer.write_response(MunmapResp::ok())
-            }
-            Err(e) => writer.write_err_response(e),
-        }
+    fn do_munmap(&mut self, guest_addr: u64) -> Result<(), i32> {
+        self.mmap_manager
+            .remove_mapping(guest_addr)
+            .map(|_| ())
+            .map_err(|_| libc::EINVAL)
     }
 
     fn do_ioctl(
@@ -1452,5 +1273,36 @@ where
         writer: &mut Writer,
     ) -> IoResult<()> {
         virtio_media_dispatch_ioctl(self, session, ioctl, reader, writer)
+    }
+
+    fn process_events(&mut self, session: &mut Self::Session) -> Result<(), i32> {
+        let events = session
+            .poller
+            .poll(Some(Duration::ZERO))
+            .map_err(|_| libc::EIO)?;
+
+        let mut has_event = false;
+
+        for event in events {
+            has_event = true;
+
+            match event {
+                PollEvent::Device(DeviceEvent::CaptureReady) => {
+                    self.dequeue_capture_buffer(session).map_err(|e| e.0)?;
+                    // Try to release OUTPUT buffers while we are at it.
+                    self.dequeue_output_buffers(session).map_err(|e| e.0)?;
+                }
+                PollEvent::Device(DeviceEvent::V4L2Event) => {
+                    self.dequeue_events(session).map_err(|e| e.0)?
+                }
+                _ => panic!(),
+            }
+        }
+
+        if !has_event {
+            log::warn!("process_events called but no event was pending");
+        }
+
+        Ok(())
     }
 }
