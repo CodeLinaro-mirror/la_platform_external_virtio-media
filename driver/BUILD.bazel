@@ -33,7 +33,7 @@ ddk_module(
     srcs = [":virtio_media_sources"],
     out = "virtio-media.ko",
     kernel_build = "//common-modules/virtual-device:virtual_device_aarch64",
-    deps = ["//common-modules/virtual-device:common_headers_aarch64"],
+    deps = ["//common:all_headers_aarch64"],
     visibility = ["//common-modules/virtual-device:__pkg__"],
 )
 
@@ -42,7 +42,7 @@ ddk_module(
     srcs = [":virtio_media_sources"],
     out = "virtio-media.ko",
     kernel_build = "//common-modules/virtual-device:virtual_device_aarch64_16k",
-    deps = ["//common-modules/virtual-device:common_headers_aarch64"],
+    deps = ["//common:all_headers_aarch64"],
     visibility = ["//common-modules/virtual-device:__pkg__"],
 )
 
@@ -51,6 +51,6 @@ ddk_module(
     srcs = [":virtio_media_sources"],
     out = "virtio-media.ko",
     kernel_build = "//common-modules/virtual-device:virtual_device_x86_64",
-    deps = ["//common-modules/virtual-device:common_headers_x86_64"],
+    deps = ["//common:all_headers_x86_64"],
     visibility = ["//common-modules/virtual-device:__pkg__"],
 )
