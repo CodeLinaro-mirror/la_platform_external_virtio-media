@@ -75,8 +75,8 @@ impl<M: VirtioMediaHostMemoryMapper> From<M> for MmapMappingManager<M> {
 pub enum RegisterBufferError {
     #[error("insufficient free space in the MMAP range")]
     NoFreeSpace,
-    #[error("requested range is already occupied")]
-    RangeOccupied,
+    #[error("requested offset is already occupied")]
+    OffsetOccupied,
     #[error("buffers of size 0 cannot be registered")]
     EmptyBuffer,
     #[error("buffer offset must be a multiple of the memory page size")]
@@ -105,29 +105,35 @@ pub enum RemoveMappingError {
     InvalidOffset,
 }
 
-const PAGE_SIZE: u64 = 0x1000;
-const PAGE_MASK: u64 = !(PAGE_SIZE - 1);
+const PAGE_SIZE: u32 = 0x1000;
+const PAGE_MASK: u32 = !(PAGE_SIZE - 1);
 
 impl<M: VirtioMediaHostMemoryMapper> MmapMappingManager<M> {
-    /// Registers a new buffer of `size` at `offset`. If `offset` if `None`, then a free space of
-    /// `size` is allocated and the offset of the buffer is returned.
+    /// Registers a new buffer at `offset`. If `offset` if `None`, then an offset is allocated and
+    /// returned.
     ///
-    /// This method fails if there is no free space of `size` in the range, or if `offset` is
-    /// `Some` and the requested space if already used by some other buffer. If `offset` is `Some`
-    /// and the function succeed, then the returned value is guaranteed to be the passed offset.
+    /// This method fails if the range is full, or if `offset` is `Some` and the requested offset
+    /// if already used by some other buffer. If `offset` is `Some` and the function succeed, then
+    /// the returned value is guaranteed to be the passed offset.
+    ///
+    /// Note that the ranges automatically allocated are of fixed size: only the offset of a
+    /// buffer is relevant when mapping it, not its size. Real V4L2 drivers also use this trick of
+    /// allocating ranges such that buffers appear to overlap. This is useful as the address space
+    /// is technically 32-bit, and we might need to use buffers which added size would not fit.
+    ///
+    /// TODO: we should recycle offsets, and further type `MmapMappingManager` so that only one
+    /// allocation type can be used per instance (fixed or dynamic).
     pub fn register_buffer(
         &mut self,
-        offset: Option<u64>,
-        size: u64,
-    ) -> Result<u64, RegisterBufferError> {
+        offset: Option<u32>,
+        size: u32,
+    ) -> Result<u32, RegisterBufferError> {
         let offset = offset.unwrap_or_else(|| {
-            // TODO: we should also look for free space inside the range if the upper bound has
-            // insufficient space.
             self.buffers
                 .last()
                 // Align the start offset to the next page, or `register_buffer_by_offset` will
                 // fail.
-                .map(|b| (b.offset as u64 + b.size as u64 + (PAGE_SIZE - 1)) & PAGE_MASK)
+                .map(|b| ((b.offset + 1).next_multiple_of(PAGE_SIZE)))
                 .unwrap_or(0)
         });
 
@@ -137,11 +143,7 @@ impl<M: VirtioMediaHostMemoryMapper> MmapMappingManager<M> {
 
     /// Unregisters the buffer previously registered at `offset`. Returns `true` if a buffer was
     /// indeed registered as starting at `offset`, `false` otherwise.
-    pub fn unregister_buffer(&mut self, offset: u64) -> bool {
-        let Ok(offset) = u32::try_from(offset) else {
-            return false;
-        };
-
+    pub fn unregister_buffer(&mut self, offset: u32) -> bool {
         match self.buffers.binary_search_by_key(&offset, |b| b.offset) {
             Err(_) => false,
             Ok(index) => {
@@ -158,14 +160,14 @@ impl<M: VirtioMediaHostMemoryMapper> MmapMappingManager<M> {
         }
     }
 
-    // Register a new buffer of `size` at `offset`. Returns an error if the [offset..size[ area is
-    // already occupied by another buffer.
+    // Register a new buffer of `size` at `offset`. Returns an error if `offset` is` already
+    // occupied by another buffer.
     //
     // `size` must be greater than `0` and `offset` must be a multiple of `PAGE_SIZE`.
     fn register_buffer_by_offset(
         &mut self,
-        offset: u64,
-        size: u64,
+        offset: u32,
+        size: u32,
     ) -> Result<(), RegisterBufferError> {
         if size == 0 {
             return Err(RegisterBufferError::EmptyBuffer);
@@ -174,44 +176,15 @@ impl<M: VirtioMediaHostMemoryMapper> MmapMappingManager<M> {
             return Err(RegisterBufferError::UnalignedOffset);
         }
 
-        let size = u32::try_from(size).map_err(|_| RegisterBufferError::NoFreeSpace)?;
-
-        let last_buffer_address = u32::try_from(offset + (size as u64 - 1))
-            .map_err(|_| RegisterBufferError::NoFreeSpace)?;
-        let offset = offset as u32;
-
-        // Check that the range starting at `offset` can indeed contain our buffer.
-        let index = match self.buffers.binary_search_by_key(&offset, |b| b.offset) {
+        // Check that `offset` is actually available.
+        match self.buffers.binary_search_by_key(&offset, |b| b.offset) {
             // Already have a registered buffer at that very offset.
-            Ok(_) => return Err(RegisterBufferError::RangeOccupied),
-            Err(index) => index,
-        };
-
-        // Check that the buffer wouldn't overlap with the next buffer.
-        let last_permitted_address = self
-            .buffers
-            .get(index)
-            .map(|b| b.offset - 1)
-            .unwrap_or(u32::MAX);
-        if last_buffer_address > last_permitted_address {
-            return Err(RegisterBufferError::RangeOccupied);
-        }
-
-        // Also check that it doesn't overlap with the previous one.
-        if index > 0 {
-            let prev_buffer = &self.buffers[index - 1];
-            let first_permitted_address = prev_buffer
-                .offset
-                .checked_add(prev_buffer.size)
-                .ok_or(RegisterBufferError::NoFreeSpace)?;
-            if offset < first_permitted_address {
-                return Err(RegisterBufferError::RangeOccupied);
+            Ok(_) => Err(RegisterBufferError::OffsetOccupied),
+            Err(index) => {
+                self.buffers.insert(index, MmapBuffer::new(offset, size));
+                Ok(())
             }
         }
-
-        self.buffers.insert(index, MmapBuffer::new(offset, size));
-
-        Ok(())
     }
 
     /// Create a new mapping for the buffer registered at `offset`. `rw` indicates whether the
@@ -226,12 +199,10 @@ impl<M: VirtioMediaHostMemoryMapper> MmapMappingManager<M> {
     /// result in a `EPERM` error.
     pub fn create_mapping(
         &mut self,
-        offset: u64,
+        offset: u32,
         fd: BorrowedFd,
         rw: bool,
     ) -> Result<(u64, u64), CreateMappingError> {
-        let offset = u32::try_from(offset).map_err(|_| CreateMappingError::InvalidOffset)?;
-        // TODO: should be we able to map from the middle of a buffer?
         let buffer = self
             .buffers
             .binary_search_by_key(&offset, |b| b.offset)
@@ -417,28 +388,38 @@ mod tests {
         );
 
         assert_eq!(
-            mm.register_buffer_by_offset(0x1000, 0x1000),
-            Err(RegisterBufferError::RangeOccupied)
-        );
-
-        assert_eq!(
             mm.register_buffer_by_offset(0x0, 0x1000),
-            Err(RegisterBufferError::RangeOccupied)
+            Err(RegisterBufferError::OffsetOccupied)
         );
 
         assert_eq!(
-            mm.register_buffer_by_offset(0x2000, 0x1000),
-            Err(RegisterBufferError::RangeOccupied)
+            mm.register_buffer_by_offset(0x1000, 0x1000),
+            Err(RegisterBufferError::OffsetOccupied)
         );
 
+        assert_eq!(mm.register_buffer_by_offset(0x2000, 0x1000), Ok(()));
         assert_eq!(
-            mm.register_buffer_by_offset(0x7000, 0x2000),
-            Err(RegisterBufferError::RangeOccupied)
+            mm.buffers,
+            vec![
+                MmapBuffer::new(0x0, 0x1000),
+                MmapBuffer::new(0x1000, 0x5000),
+                MmapBuffer::new(0x2000, 0x1000),
+                MmapBuffer::new(0x6000, 0x2000),
+                MmapBuffer::new(0xa000, 0x1000),
+            ]
         );
 
+        assert_eq!(mm.register_buffer_by_offset(0x7000, 0x2000), Ok(()));
         assert_eq!(
-            mm.register_buffer_by_offset(0x8000, 0x2100),
-            Err(RegisterBufferError::RangeOccupied)
+            mm.buffers,
+            vec![
+                MmapBuffer::new(0x0, 0x1000),
+                MmapBuffer::new(0x1000, 0x5000),
+                MmapBuffer::new(0x2000, 0x1000),
+                MmapBuffer::new(0x6000, 0x2000),
+                MmapBuffer::new(0x7000, 0x2000),
+                MmapBuffer::new(0xa000, 0x1000),
+            ]
         );
 
         assert_eq!(mm.register_buffer_by_offset(0x8000, 0x2000), Ok(()));
@@ -447,7 +428,9 @@ mod tests {
             vec![
                 MmapBuffer::new(0x0, 0x1000),
                 MmapBuffer::new(0x1000, 0x5000),
+                MmapBuffer::new(0x2000, 0x1000),
                 MmapBuffer::new(0x6000, 0x2000),
+                MmapBuffer::new(0x7000, 0x2000),
                 MmapBuffer::new(0x8000, 0x2000),
                 MmapBuffer::new(0xa000, 0x1000),
             ]
@@ -459,7 +442,9 @@ mod tests {
             vec![
                 MmapBuffer::new(0x0, 0x1000),
                 MmapBuffer::new(0x1000, 0x5000),
+                MmapBuffer::new(0x2000, 0x1000),
                 MmapBuffer::new(0x6000, 0x2000),
+                MmapBuffer::new(0x7000, 0x2000),
                 MmapBuffer::new(0x8000, 0x2000),
                 MmapBuffer::new(0xa000, 0x1000),
                 MmapBuffer::new(0xffff_f000, 0x1000),
@@ -472,7 +457,9 @@ mod tests {
             vec![
                 MmapBuffer::new(0x0, 0x1000),
                 MmapBuffer::new(0x1000, 0x5000),
+                MmapBuffer::new(0x2000, 0x1000),
                 MmapBuffer::new(0x6000, 0x2000),
+                MmapBuffer::new(0x7000, 0x2000),
                 MmapBuffer::new(0x8000, 0x2000),
                 MmapBuffer::new(0xa000, 0x1000),
             ]
@@ -484,6 +471,8 @@ mod tests {
             vec![
                 MmapBuffer::new(0x0, 0x1000),
                 MmapBuffer::new(0x1000, 0x5000),
+                MmapBuffer::new(0x2000, 0x1000),
+                MmapBuffer::new(0x7000, 0x2000),
                 MmapBuffer::new(0x8000, 0x2000),
                 MmapBuffer::new(0xa000, 0x1000),
             ]
@@ -495,6 +484,8 @@ mod tests {
             vec![
                 MmapBuffer::new(0x0, 0x1000),
                 MmapBuffer::new(0x1000, 0x5000),
+                MmapBuffer::new(0x2000, 0x1000),
+                MmapBuffer::new(0x7000, 0x2000),
                 MmapBuffer::new(0x8000, 0x2000),
                 MmapBuffer::new(0xa000, 0x1000),
             ]
@@ -506,6 +497,8 @@ mod tests {
             vec![
                 MmapBuffer::new(0x0, 0x1000),
                 MmapBuffer::new(0x1000, 0x5000),
+                MmapBuffer::new(0x2000, 0x1000),
+                MmapBuffer::new(0x7000, 0x2000),
                 MmapBuffer::new(0x8000, 0x2000),
                 MmapBuffer::new(0xa000, 0x1000),
             ]
@@ -516,6 +509,8 @@ mod tests {
             mm.buffers,
             vec![
                 MmapBuffer::new(0x1000, 0x5000),
+                MmapBuffer::new(0x2000, 0x1000),
+                MmapBuffer::new(0x7000, 0x2000),
                 MmapBuffer::new(0x8000, 0x2000),
                 MmapBuffer::new(0xa000, 0x1000),
             ]
@@ -526,21 +521,38 @@ mod tests {
             mm.buffers,
             vec![
                 MmapBuffer::new(0x1000, 0x5000),
+                MmapBuffer::new(0x2000, 0x1000),
+                MmapBuffer::new(0x7000, 0x2000),
                 MmapBuffer::new(0x8000, 0x2000),
             ]
         );
 
         assert!(mm.unregister_buffer(0x1000));
-        assert_eq!(mm.buffers, vec![MmapBuffer::new(0x8000, 0x2000),]);
+        assert_eq!(
+            mm.buffers,
+            vec![
+                MmapBuffer::new(0x2000, 0x1000),
+                MmapBuffer::new(0x7000, 0x2000),
+                MmapBuffer::new(0x8000, 0x2000),
+            ]
+        );
 
         assert!(mm.unregister_buffer(0x8000));
-        assert_eq!(mm.buffers, vec![]);
+        assert_eq!(
+            mm.buffers,
+            vec![
+                MmapBuffer::new(0x2000, 0x1000),
+                MmapBuffer::new(0x7000, 0x2000),
+            ]
+        );
 
         assert_eq!(
-            mm.register_buffer_by_offset(0x0, 0x1_0000_0000),
-            Err(RegisterBufferError::NoFreeSpace)
+            mm.buffers,
+            vec![
+                MmapBuffer::new(0x2000, 0x1000),
+                MmapBuffer::new(0x7000, 0x2000),
+            ]
         );
-        assert_eq!(mm.buffers, vec![]);
     }
 
     #[test]
@@ -559,17 +571,17 @@ mod tests {
             ]
         );
 
-        assert_eq!(mm.register_buffer(None, 0xffff_a000), Ok(0x6000));
+        assert_eq!(mm.register_buffer(None, 0xffff_a000), Ok(0x2000));
         assert_eq!(
             mm.buffers,
             vec![
                 MmapBuffer::new(0x0, 0x1000),
                 MmapBuffer::new(0x1000, 0x5000),
-                MmapBuffer::new(0x6000, 0xffff_a000),
+                MmapBuffer::new(0x2000, 0xffff_a000),
             ]
         );
 
-        assert!(mm.unregister_buffer(0x6000));
+        assert!(mm.unregister_buffer(0x2000));
         assert_eq!(
             mm.buffers,
             vec![
@@ -578,15 +590,13 @@ mod tests {
             ]
         );
 
-        assert_eq!(
-            mm.register_buffer(None, 0xffff_b000),
-            Err(RegisterBufferError::NoFreeSpace)
-        );
+        assert_eq!(mm.register_buffer(None, 0xffff_b000), Ok(0x2000));
         assert_eq!(
             mm.buffers,
             vec![
                 MmapBuffer::new(0x0, 0x1000),
                 MmapBuffer::new(0x1000, 0x5000),
+                MmapBuffer::new(0x2000, 0xffff_b000),
             ]
         );
     }
