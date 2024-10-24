@@ -78,6 +78,7 @@ use v4l2r::ioctl::V4l2PlanesWithBackingMut;
 use v4l2r::memory::Memory;
 use v4l2r::memory::MemoryType;
 use v4l2r::memory::UserPtr;
+use v4l2r::QueueDirection;
 use v4l2r::QueueType;
 
 use crate::ioctl::virtio_media_dispatch_ioctl;
@@ -107,6 +108,7 @@ fn guest_v4l2_buffer_to_host<M: VirtioMediaGuestMemoryMapper>(
     let mut resources = vec![];
     // The host buffer is a copy of the guest's with its plane resources updated.
     let mut host_buffer = guest_buffer.clone();
+    let writable = host_buffer.queue().direction() == QueueDirection::Capture;
 
     if let V4l2PlanesWithBackingMut::UserPtr(host_planes) =
         host_buffer.planes_with_backing_iter_mut()
@@ -114,9 +116,13 @@ fn guest_v4l2_buffer_to_host<M: VirtioMediaGuestMemoryMapper>(
         for (mut host_plane, mem_regions) in
             host_planes.filter(|p| *p.length > 0).zip(guest_regions)
         {
-            let mapping = m.new_mapping(mem_regions)?;
+            let mut mapping = m.new_mapping(mem_regions)?;
 
-            host_plane.set_userptr(mapping.as_ptr() as GuestAddrType);
+            host_plane.set_userptr(if writable {
+                mapping.as_mut_ptr()
+            } else {
+                mapping.as_ptr()
+            } as GuestAddrType);
             resources.push(mapping);
         }
     };
@@ -353,7 +359,7 @@ pub struct V4l2ProxyDevice<
 
     /// Map of memory offsets to detailed buffer information. Only used for queues which memory
     /// type is MMAP.
-    mmap_buffers: BTreeMap<u64, V4l2MmapPlaneInfo>,
+    mmap_buffers: BTreeMap<u32, V4l2MmapPlaneInfo>,
 
     mmap_manager: MmapMappingManager<HM>,
 }
@@ -426,11 +432,11 @@ where
                     let offset = plane.mem_offset();
 
                     self.mmap_manager
-                        .register_buffer(Some(offset as u64), *plane.length as u64)
+                        .register_buffer(Some(offset), *plane.length)
                         .unwrap();
 
                     self.mmap_buffers.insert(
-                        offset as u64,
+                        offset,
                         V4l2MmapPlaneInfo {
                             session_id: session.id,
                             queue,
@@ -1223,11 +1229,14 @@ where
         &mut self,
         session: &mut Self::Session,
         flags: u32,
-        offset: u64,
+        offset: u32,
     ) -> Result<(u64, u64), i32> {
         let rw = (flags & VIRTIO_MEDIA_MMAP_FLAG_RW) != 0;
 
-        let plane_info = self.mmap_buffers.get_mut(&offset).ok_or(libc::EINVAL)?;
+        let plane_info = self
+            .mmap_buffers
+            .get_mut(&offset)
+            .ok_or(libc::EINVAL)?;
 
         // Export the FD for the plane and cache it if needed.
         //
