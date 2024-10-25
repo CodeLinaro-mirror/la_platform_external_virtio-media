@@ -204,12 +204,12 @@ pub trait VirtioMediaDevice<Reader: std::io::Read, Writer: std::io::Write> {
     /// Only returns an error if the response could not be properly written ; all other errors are
     /// propagated to the guest.
     //
-    // TODO flags should be a dedicated enum?
+    // TODO: flags should be a dedicated enum?
     fn do_mmap(
         &mut self,
         session: &mut Self::Session,
         flags: u32,
-        offset: u64,
+        offset: u32,
     ) -> Result<(u64, u64), i32>;
     /// Performs the MUNMAP command.
     ///
@@ -422,7 +422,7 @@ where
             VIRTIO_MEDIA_CMD_MUNMAP => reader
                 .read_obj()
                 .context("while reading UNMMAP command")
-                .and_then(|MunmapCmd { offset: guest_addr }| {
+                .and_then(|MunmapCmd { guest_addr }| {
                     match self.device.do_munmap(guest_addr) {
                         Ok(()) => writer.write_response(MunmapResp::ok()),
                         Err(e) => writer.write_err_response(e),

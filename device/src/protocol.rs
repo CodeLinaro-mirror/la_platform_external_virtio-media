@@ -23,6 +23,12 @@ pub struct VirtioMediaDeviceConfig {
     pub card: [u8; VIRTIO_MEDIA_CARD_NAME_LEN],
 }
 
+impl AsRef<[u8]> for VirtioMediaDeviceConfig {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
 pub const VIRTIO_MEDIA_CMD_OPEN: u32 = 1;
 pub const VIRTIO_MEDIA_CMD_CLOSE: u32 = 2;
 pub const VIRTIO_MEDIA_CMD_IOCTL: u32 = 3;
@@ -195,14 +201,14 @@ pub struct IoctlCmd {
 pub struct MmapCmd {
     pub session_id: u32,
     pub flags: u32,
-    pub offset: u64,
+    pub offset: u32,
 }
 
 #[repr(C)]
 #[derive(Debug, AsBytes)]
 pub struct MmapResp {
     hdr: RespHeader,
-    offset: u64,
+    guest_addr: u64,
     len: u64,
 }
 
@@ -210,7 +216,7 @@ impl MmapResp {
     pub fn ok(addr: u64, len: u64) -> Self {
         Self {
             hdr: RespHeader::ok(),
-            offset: addr,
+            guest_addr: addr,
             len,
         }
     }
@@ -219,7 +225,7 @@ impl MmapResp {
 #[repr(C)]
 #[derive(Debug, FromZeroes, FromBytes)]
 pub struct MunmapCmd {
-    pub offset: u64,
+    pub guest_addr: u64,
 }
 
 #[repr(C)]
