@@ -70,7 +70,7 @@ struct Buffer {
     /// Offset that can be used to map the buffer.
     ///
     /// Cached from `v4l2_buffer` to avoid doing a match.
-    offset: u64,
+    offset: u32,
 }
 
 impl Buffer {
@@ -242,7 +242,7 @@ where
         &mut self,
         session: &mut Self::Session,
         flags: u32,
-        offset: u64,
+        offset: u32,
     ) -> Result<(u64, u64), i32> {
         let buffer = session
             .buffers
@@ -422,7 +422,7 @@ where
                     .and_then(|fd| {
                         let offset = self
                             .mmap_manager
-                            .register_buffer(None, BUFFER_SIZE as u64)
+                            .register_buffer(None, BUFFER_SIZE)
                             .map_err(|_| libc::EINVAL)?;
 
                         let mut v4l2_buffer =
@@ -432,7 +432,7 @@ where
                         {
                             // SAFETY: every buffer has at least one plane.
                             let mut plane = planes.next().unwrap();
-                            plane.set_mem_offset(offset as u32);
+                            plane.set_mem_offset(offset);
                             *plane.length = BUFFER_SIZE;
                         } else {
                             // SAFETY: we have just set the buffer type to MMAP. Reaching this point means a bug in
