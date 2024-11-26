@@ -9,7 +9,7 @@ use zerocopy::AsBytes;
 use zerocopy::FromBytes;
 use zerocopy::FromZeroes;
 
-pub const VIRTIO_ID_MEDIA: u32 = 49;
+pub const VIRTIO_ID_MEDIA: u32 = 48;
 
 const VIRTIO_MEDIA_CARD_NAME_LEN: usize = 32;
 #[derive(Debug, AsBytes)]
@@ -208,7 +208,7 @@ pub struct MmapCmd {
 #[derive(Debug, AsBytes)]
 pub struct MmapResp {
     hdr: RespHeader,
-    guest_addr: u64,
+    driver_addr: u64,
     len: u64,
 }
 
@@ -216,7 +216,7 @@ impl MmapResp {
     pub fn ok(addr: u64, len: u64) -> Self {
         Self {
             hdr: RespHeader::ok(),
-            guest_addr: addr,
+            driver_addr: addr,
             len,
         }
     }
@@ -225,7 +225,7 @@ impl MmapResp {
 #[repr(C)]
 #[derive(Debug, FromZeroes, FromBytes)]
 pub struct MunmapCmd {
-    pub guest_addr: u64,
+    pub driver_addr: u64,
 }
 
 #[repr(C)]
