@@ -8,13 +8,13 @@ third_party {
   license_type: RESTRICTED
   last_upgrade_date {
     year: 2024
-    month: 10
-    day: 22
+    month: 11
+    day: 26
   }
   identifier {
     type: "Git"
     value: "https://github.com/chromeos/virtio-media"
-    version: "v0.0.5"
+    version: "598283b5ebe4854dd33b22a0987db0947af8e537"
     primary_source: true
   }
 }
