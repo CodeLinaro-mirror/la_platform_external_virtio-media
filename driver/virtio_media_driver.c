@@ -16,10 +16,6 @@
 #include <linux/vmalloc.h>
 #include <linux/wait.h>
 #include <linux/workqueue.h>
-#include <media/frame_vector.h>
-#include <media/v4l2-dev.h>
-#include <media/v4l2-event.h>
-#include <media/videobuf2-memops.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
 #include <linux/version.h>
@@ -27,6 +23,10 @@
 #include <linux/virtio_config.h>
 #include <linux/virtio_ids.h>
 
+#include <media/frame_vector.h>
+#include <media/v4l2-dev.h>
+#include <media/v4l2-event.h>
+#include <media/videobuf2-memops.h>
 #include <media/v4l2-device.h>
 #include <media/v4l2-ioctl.h>
 
@@ -37,7 +37,7 @@
 #define VIRTIO_MEDIA_NUM_EVENT_BUFS 16
 
 #ifndef VIRTIO_ID_MEDIA
-#define VIRTIO_ID_MEDIA 49
+#define VIRTIO_ID_MEDIA 48
 #endif
 
 /* ID of the SHM region into which MMAP buffer will be mapped. */
@@ -622,7 +622,7 @@ static void virtio_media_vma_close_locked(struct vm_area_struct *vma)
 
 	mutex_lock(&vv->bufs_lock);
 	cmd_munmap->hdr.cmd = VIRTIO_MEDIA_CMD_MUNMAP;
-	cmd_munmap->guest_addr =
+	cmd_munmap->driver_addr =
 		(vma->vm_pgoff << PAGE_SHIFT) - vv->mmap_region.addr;
 	ret = virtio_media_send_command(vv, sgs, 1, 1, sizeof(*resp_munmap),
 					NULL);
@@ -699,7 +699,7 @@ static int virtio_media_device_mmap(struct file *file,
 	 * Keep the guest address at which the buffer is mapped since we will
 	 * use that to unmap.
 	 */
-	vma->vm_pgoff = (resp_mmap->guest_addr + vv->mmap_region.addr) >>
+	vma->vm_pgoff = (resp_mmap->driver_addr + vv->mmap_region.addr) >>
 			PAGE_SHIFT;
 
 	if (vma->vm_end - vma->vm_start > PAGE_ALIGN(resp_mmap->len)) {
@@ -852,6 +852,7 @@ static void virtio_media_remove(struct virtio_device *virtio_dev)
 	struct virtio_media *vv = virtio_dev->priv;
 	struct list_head *p, *n;
 
+	cancel_work_sync(&vv->eventq_work);
 	virtio_reset_device(virtio_dev);
 
 	v4l2_device_unregister(&vv->v4l2_dev);
