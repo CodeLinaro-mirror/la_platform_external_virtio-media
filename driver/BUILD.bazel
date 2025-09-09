@@ -38,6 +38,15 @@ ddk_module(
 )
 
 ddk_module(
+    name = "aarch64_tv/virtio-media",
+    srcs = [":virtio_media_sources"],
+    out = "virtio-media.ko",
+    kernel_build = "//common-modules/virtual-device:virtual_device_aarch64_tv",
+    deps = ["//common:all_headers_aarch64"],
+    visibility = ["//common-modules/virtual-device:__pkg__"],
+)
+
+ddk_module(
     name = "aarch64_16k/virtio-media",
     srcs = [":virtio_media_sources"],
     out = "virtio-media.ko",
