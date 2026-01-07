@@ -10,7 +10,6 @@
 #define __VIRTIO_MEDIA_SESSION_H
 
 #include <linux/scatterlist.h>
-#include <linux/version.h>
 #include <media/v4l2-fh.h>
 
 #include "protocol.h"
@@ -68,7 +67,6 @@ struct virtio_media_queue_state {
  *
  * @fh: file handler for the session.
  * @id: session ID used to communicate with the device.
- * @file: file pointer associated with the session's file handler.
  * @nonblocking_dequeue: whether dequeue should block or not (nonblocking if file opened with O_NONBLOCK).
  * @uses_mplane: whether the queues for this session use the MPLANE API or not.
  * @cmd: union of session-related commands. Each session can have one command currently running.
@@ -82,7 +80,6 @@ struct virtio_media_queue_state {
  */
 struct virtio_media_session {
 	struct v4l2_fh fh;
-	struct file *file;
 	u32 id;
 	bool nonblocking_dequeue;
 	bool uses_mplane;
@@ -113,24 +110,5 @@ static inline struct virtio_media_session *fh_to_session(struct v4l2_fh *fh)
 {
 	return container_of(fh, struct virtio_media_session, fh);
 }
-
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 18, 0)
-static inline void
-virtio_media_session_fh_add(struct virtio_media_session *session,
-			    struct file *file)
-{
-	v4l2_fh_add(&session->fh, file);
-	session->file = file;
-}
-
-static inline void
-virtio_media_session_fh_del(struct virtio_media_session *session)
-{
-	v4l2_fh_del(&session->fh, session->file);
-}
-#else
-#define virtio_media_session_fh_add(session, file) v4l2_fh_add(&(session)->fh)
-#define virtio_media_session_fh_del(session)       v4l2_fh_del(&(session)->fh)
-#endif
 
 #endif // __VIRTIO_MEDIA_SESSION_H
