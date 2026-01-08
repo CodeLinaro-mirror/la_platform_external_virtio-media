@@ -7,14 +7,14 @@ description: "Rust device (MIT) and kernel device driver (GPLv2) for virtio-medi
 third_party {
   license_type: RESTRICTED
   last_upgrade_date {
-    year: 2024
+    year: 2025
     month: 11
-    day: 26
+    day: 3
   }
   identifier {
     type: "Git"
     value: "https://github.com/chromeos/virtio-media"
-    version: "598283b5ebe4854dd33b22a0987db0947af8e537"
+    version: "c6cc93af5372d6aa37e370f88cfdb9288d27d66a"
     primary_source: true
   }
 }
