@@ -19,8 +19,8 @@ filegroup(
     name = "virtio_media_sources",
     srcs = [
         "protocol.h",
-        "scatterlist_filler.c",
-        "scatterlist_filler.h",
+        "scatterlist_builder.c",
+        "scatterlist_builder.h",
         "session.h",
         "virtio_media.h",
         "virtio_media_driver.c",
