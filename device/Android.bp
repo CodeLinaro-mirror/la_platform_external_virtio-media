@@ -18,7 +18,7 @@ rust_library {
     host_supported: true,
     crate_name: "virtio_media",
     cargo_env_compat: true,
-    cargo_pkg_version: "0.0.5",
+    cargo_pkg_version: "0.0.7",
     crate_root: "src/lib.rs",
     edition: "2021",
     features: [
@@ -32,7 +32,7 @@ rust_library {
         "libnix",
         "libthiserror",
         "libv4l2r",
-        "libzerocopy-0.7.35",
+        "libzerocopy",
     ],
     proc_macros: ["libenumn"],
     apex_available: [
@@ -48,7 +48,7 @@ rust_test {
     host_supported: true,
     crate_name: "virtio_media",
     cargo_env_compat: true,
-    cargo_pkg_version: "0.0.5",
+    cargo_pkg_version: "0.0.7",
     crate_root: "src/lib.rs",
     test_suites: ["general-tests"],
     auto_gen_config: true,
@@ -67,7 +67,7 @@ rust_test {
         "libnix",
         "libthiserror",
         "libv4l2r",
-        "libzerocopy-0.7.35",
+        "libzerocopy",
     ],
     proc_macros: ["libenumn"],
 }
