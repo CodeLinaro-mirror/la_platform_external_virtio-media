@@ -63,6 +63,7 @@ use v4l2r::ioctl::EventType as V4l2EventType;
 use v4l2r::ioctl::ExpbufFlags;
 use v4l2r::ioctl::ExtControlError;
 use v4l2r::ioctl::IntoErrno;
+use v4l2r::ioctl::MemoryConsistency;
 use v4l2r::ioctl::QueryCapError;
 use v4l2r::ioctl::QueryCtrlFlags;
 use v4l2r::ioctl::SelectionFlags;
@@ -263,7 +264,7 @@ pub struct V4l2Session<M: VirtioMediaGuestMemoryMapper> {
 }
 
 impl<M: VirtioMediaGuestMemoryMapper> VirtioMediaDeviceSession for V4l2Session<M> {
-    fn poll_fd(&self) -> Option<BorrowedFd> {
+    fn poll_fd(&self) -> Option<BorrowedFd<'_>> {
         Some(self.poller.as_fd())
     }
 }
@@ -611,9 +612,10 @@ where
         queue: QueueType,
         memory: MemoryType,
         count: u32,
+        flags: MemoryConsistency,
     ) -> IoctlResult<v4l2_requestbuffers> {
         let mut reqbufs: v4l2_requestbuffers =
-            v4l2r::ioctl::reqbufs(&session.device, queue, memory, count)
+            v4l2r::ioctl::reqbufs(&session.device, queue, memory, count, flags)
                 .map_err(IntoErrno::into_errno)?;
 
         // We do not support requests at the moment, so do not advertize them.
@@ -1102,10 +1104,12 @@ where
             memory,
             format,
         )
-        .map_err(|e| (e.into_errno()))?;
+        .map_err(|e| e.into_errno())?;
 
-        let bufs_range = create_bufs.index..(create_bufs.index + create_bufs.count);
-        self.update_mmap_offsets(session, queue, bufs_range);
+        if count > 0 {
+            let bufs_range = create_bufs.index..(create_bufs.index + create_bufs.count);
+            self.update_mmap_offsets(session, queue, bufs_range);
+        }
 
         Ok(create_bufs)
     }
