@@ -1,4 +1,7 @@
 {
   "run_cargo": false,
+  "module_name_overrides": {
+    "libnix": "libnix_0_29_0"
+  },
   "tests": true
 }
