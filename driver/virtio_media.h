@@ -34,8 +34,10 @@ extern bool virtio_media_allow_userptr;
  * @sessions: list of active sessions on the device.
  * @sessions_lock: protects @sessions and ``virtio_media_session::list``.
  * @events_lock: prevents concurrent processing of events.
- * @cmd: union of device-related commands.
- * @resp: union of device-related responses.
+ * @cmd: union of the device commands "open" and "munmap". The other
+ *       commands are handled by @struct virtio_media_session
+ * @resp: union of responses.to device commands "open" and "munmap". The
+ *        other responses are handled by @struct virtio_media_session
  * @vlock: serializes access to the command queue.
  * @wq: waitqueue for host responses on the command queue.
  */
@@ -53,9 +55,9 @@ struct virtio_media {
 	void *event_buffer;
 
 	struct list_head sessions;
-	struct mutex sessions_lock;
+	struct mutex sessions_lock; /* protects sessions list */
 
-	struct mutex events_lock;
+	struct mutex events_lock; /* prevents concurrent event processing */
 
 	union {
 		struct virtio_media_cmd_open open;
@@ -67,7 +69,7 @@ struct virtio_media {
 		struct virtio_media_resp_munmap munmap;
 	} resp;
 
-	struct mutex vlock;
+	struct mutex vlock; /* serializes command queue access */
 	wait_queue_head_t wq;
 };
 
