@@ -9,12 +9,12 @@ third_party {
   last_upgrade_date {
     year: 2026
     month: 5
-    day: 19
+    day: 21
   }
   identifier {
     type: "Git"
     value: "https://github.com/chromeos/virtio-media"
-    version: "62d94562db5e03958c6ad3849516d4f95248c7a3"
+    version: "ebcef1a5037a1dc5869af8aa82ed75a2e7739f0f"
     primary_source: true
   }
 }
